@@ -26,6 +26,7 @@
 #include "GUI.h"
 #include "Input.h"
 #include "Options.h"
+#include "Remote.h"
 #include "Sound.h"
 #include "UI.h"
 #include "Video.h"
@@ -52,12 +53,14 @@ bool Init(int argc_, char* argv_[])
     if (!Options::Load(argc_, argv_))
         return false;
 
-    return OSD::Init() && Frame::Init() && CPU::Init(true) && UI::Init() && Sound::Init() && Input::Init() && Video::Init();
+    return OSD::Init() && Frame::Init() && CPU::Init(true) && UI::Init() && Sound::Init() && Input::Init() && Video::Init() && Remote::Init();
 }
 
 void Exit()
 {
     GUI::Stop();
+
+    Remote::Exit();
 
     Video::Exit();
     Input::Exit();

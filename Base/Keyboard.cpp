@@ -26,6 +26,7 @@
 #include "Keyin.h"
 #include "Memory.h"
 #include "Options.h"
+#include "Remote.h"
 
 namespace Keyboard
 {
@@ -166,7 +167,7 @@ void Purge()
 
 
 // Build the SAM keyboard matrix from the current PC state
-void Update()
+static void UpdateFromHost()
 {
     // Save a copy of the current key state, so we can modify it during matching below
     static decltype(key_states) key_states_copy;
@@ -278,6 +279,46 @@ void Update()
 
     // Restore the key states
     key_states = key_states_copy;
+}
+
+void Update()
+{
+    UpdateFromHost();
+
+    // Keys pressed over the remote control are merged at matrix level
+    Remote::ApplyKeys(key_matrix);
+}
+
+// Map an ASCII character to the SAM key and modifier (or SK_NONE) that type it
+bool CharToSamKeys(int ch, eSamKey& mod, eSamKey& key)
+{
+    if (ch == '\n') ch = HK_RETURN;
+    if (ch == 127) ch = HK_BACKSPACE;
+
+    bool upper = (ch >= 'A' && ch <= 'Z');
+    auto lower_ch = upper ? (ch - 'A' + 'a') : ch;
+
+    for (int i = SK_MIN; i < SK_MAX; i++)
+    {
+        if (asKeyMatrix[i].nChar == lower_ch)
+        {
+            mod = upper ? SK_SHIFT : SK_NONE;
+            key = static_cast<eSamKey>(i);
+            return true;
+        }
+    }
+
+    for (int i = 0; asSamKeys[i].nChar; i++)
+    {
+        if (asSamKeys[i].nChar == ch)
+        {
+            mod = asSamKeys[i].nSamMods;
+            key = asSamKeys[i].nSamKey;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 

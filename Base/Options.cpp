@@ -170,6 +170,10 @@ auto set_named_value(const std::string& option_name, const std::string& str) -> 
     else if (name == "fkeys") { set_value(g_config.fkeys, str); }
     else if (name == "rasterdebug") { set_value(g_config.rasterdebug, str); }
     else if (name == "exitonhalt") { set_value(g_config.exitonhalt, str); }
+    else if (name == "remote") { set_value(g_config.remote, str); }
+    else if (name == "remoteport") { set_value(g_config.remoteport, str); }
+    else if (name == "headless") { set_value(g_config.headless, str); }
+    else if (name == "background") { set_value(g_config.background, str); }
     else
     {
         return false;
@@ -190,8 +194,18 @@ bool Load(int argc_, char* argv_[])
     // Set defaults.
     g_config = {};
 
+    // Headless runs use default settings, for repeatable tests
+    bool headless = false;
+    for (int i = 1; i + 1 < argc_; ++i)
+    {
+        if (!strcmp(argv_[i], "-headless"))
+            set_value(headless, argv_[i + 1]);
+    }
+
     auto path = OSD::MakeFilePath(PathType::Settings, OPTIONS_FILE);
-    std::ifstream file(path);
+    std::ifstream file;
+    if (!headless)
+        file.open(path);
     for (std::string line; std::getline(file, line); )
     {
         if (!line.empty() && line.back() == '\r')
@@ -252,6 +266,15 @@ bool Load(int argc_, char* argv_[])
         }
     }
 
+    if (g_config.headless)
+    {
+        // No on-screen extras in screenshots
+        g_config.remote = true;
+        g_config.profile = false;
+        g_config.status = false;
+        g_config.drivelights = 0;
+    }
+
     if (!g_config.keyin.empty())
         IO::QueueAutoBoot(AutoLoadType::Keyin);
     else if (drive_arg > 1)
@@ -262,6 +285,10 @@ bool Load(int argc_, char* argv_[])
 
 auto Save() -> bool
 {
+    // Remote-controlled and headless runs never change the user's settings
+    if (g_config.remote || g_config.headless)
+        return true;
+
     auto path{ OSD::MakeFilePath(PathType::Settings, OPTIONS_FILE) };
     Config defaults{};
 

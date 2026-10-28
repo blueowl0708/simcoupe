@@ -353,6 +353,15 @@ static void sendUserEvent (int event)
 @end
 
 
+/* True if the command line has "-name value" with a true value */
+static BOOL hasOption(int argc, char **argv, const char *name)
+{
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], name))
+            return !strcmp(argv[i+1], "1") || !strcmp(argv[i+1], "true") || !strcmp(argv[i+1], "yes");
+    return NO;
+}
+
 /* Replacement for NSApplicationMain */
 static int CustomApplicationMain (int argc, char **argv)
 {
@@ -362,10 +371,10 @@ static int CustomApplicationMain (int argc, char **argv)
     [NSApplication sharedApplication];
 
     CPSProcessSerNum PSN;
-    /* Tell the dock about us */
+    /* Tell the dock about us, and come to the front unless -background is set */
     if (!CPSGetCurrentProcess(&PSN))
         if (!CPSEnableForegroundOperation(&PSN,0x03,0x3C,0x2C,0x1103))
-            if (!CPSSetFrontProcess(&PSN))
+            if (hasOption(argc, argv, "-background") || !CPSSetFrontProcess(&PSN))
                 [NSApplication sharedApplication];
 
     /* Disable press-and-hold for keys, to suppress accents popup menu */
@@ -412,6 +421,10 @@ int main (int argc, char **argv)
             gArgv[i] = argv[i];
         gFinderLaunch = NO;
     }
+
+    /* Headless: no Cocoa application, so no dock icon, menu bar or focus change */
+    if (hasOption(argc, argv, "-headless"))
+        return SimCoupe_main(argc, argv);
 
     return CustomApplicationMain(argc, argv);
 }

@@ -44,6 +44,7 @@
 #include "Memory.h"
 #include "Mouse.h"
 #include "Options.h"
+#include "Remote.h"
 #include "Tape.h"
 #include "UI.h"
 
@@ -125,6 +126,12 @@ void ExecuteChunk()
         if (cpu.get_iregp_kind() != z80::iregp::hl)
             continue;
 
+        if (Remote::trace_instructions && Remote::OnInstruction())
+        {
+            g_fBreak = true;
+            continue;
+        }
+
 #ifdef _DEBUG
         if (debug_break)
         {
@@ -153,7 +160,9 @@ void Run()
 {
     while (!g_fQuit && UI::CheckEvents())
     {
-        if (g_fPaused)
+        Remote::Poll();
+
+        if (g_fPaused || Remote::IsStopped())
             continue;
 
         if (!Debug::IsActive() && !GUI::IsModal())
@@ -164,6 +173,9 @@ void Run()
         if (CPU::frame_cycles >= CPU_CYCLES_PER_FRAME)
         {
             EventFrameEnd(CPU_CYCLES_PER_FRAME);
+
+            // Before the input update, so remote key changes apply to the next frame
+            Remote::OnFrameEnd();
 
             IO::FrameUpdate();
             Debug::FrameEnd();

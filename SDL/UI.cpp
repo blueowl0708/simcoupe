@@ -32,6 +32,7 @@
 #include "Input.h"
 #include "Keyin.h"
 #include "Options.h"
+#include "Remote.h"
 #include "Sound.h"
 #include "SDL20.h"
 #include "SDL20_GL3.h"
@@ -75,9 +76,23 @@ void UI::Exit(bool fReInit_/*=false*/)
 }
 
 
+// Headless video: the frame buffer is still drawn (for save-screen) but never shown
+class NullVideo : public IVideoBase
+{
+public:
+    bool Init() override { return true; }
+    Rect DisplayRect() const override { return { 0, 0, Frame::AspectWidth(), Frame::Height() }; }
+    void ResizeWindow(int) const override { }
+    void OptionsChanged() override { }
+    void Update(const FrameBuffer&) override { }
+};
+
 // Create a video object to render the display
 std::unique_ptr<IVideoBase> UI::CreateVideo()
 {
+    if (GetOption(headless))
+        return std::make_unique<NullVideo>();
+
 #ifdef HAVE_OPENGL
     if (auto backend = std::make_unique<SDL_GL3>(); backend->Init())
     {
@@ -189,8 +204,9 @@ bool UI::CheckEvents()
             }
         }
 
-        // If we're not paused, break out to run the next frame
-        if (!g_fPaused)
+        // If we're not paused, break out to run the next frame.
+        // With remote control on, return so the main loop keeps polling it.
+        if (!g_fPaused || Remote::IsActive())
             break;
 
         SDL_WaitEvent(nullptr);
@@ -202,6 +218,14 @@ bool UI::CheckEvents()
 void UI::ShowMessage(MsgType type, const std::string& str)
 {
     constexpr auto caption = "SimCoupe";
+
+    // Headless: no dialogs, which would stall the emulation unseen
+    if (GetOption(headless))
+    {
+        fprintf(stderr, "%s\n", str.c_str());
+        Remote::Log(str);
+        return;
+    }
 
     if (type == MsgType::Info)
         GUI::Start(new MsgBox(nullptr, str, caption, mbInformation));

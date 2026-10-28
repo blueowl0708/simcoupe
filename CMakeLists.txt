@@ -46,7 +46,7 @@ set(BASE_CPP_FILES
     Base/Disassem.cpp Base/Disk.cpp Base/Drive.cpp Base/Expr.cpp Base/Events.cpp
     Base/Font.cpp Base/Frame.cpp Base/FrameBuffer.cpp Base/GIF.cpp Base/GUI.cpp
     Base/GUIDlg.cpp Base/GUIIcons.cpp Base/HardDisk.cpp Base/Joystick.cpp
-    Base/Keyboard.cpp Base/Keyin.cpp Base/Main.cpp Base/Memory.cpp
+    Base/Keyboard.cpp Base/Keyin.cpp Base/Main.cpp Base/Memory.cpp Base/Remote.cpp
     Base/Mouse.cpp Base/Options.cpp Base/Parallel.cpp Base/Paula.cpp
     Base/SavePNG.cpp Base/SAMIO.cpp Base/SAMVox.cpp Base/SDIDE.cpp
     Base/SID.cpp Base/Sound.cpp Base/SSX.cpp Base/Stream.cpp Base/Symbol.cpp

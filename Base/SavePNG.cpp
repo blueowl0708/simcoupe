@@ -197,4 +197,14 @@ bool Save(const FrameBuffer& fb)
     return false;
 }
 
+bool Save(const FrameBuffer& fb, const std::string& path)
+{
+#ifdef HAVE_LIBZ
+    unique_FILE file = fopen(path.c_str(), "wb");
+    return file && SaveFile(file, fb);
+#else
+    return false;
+#endif
+}
+
 } // namespace PNG

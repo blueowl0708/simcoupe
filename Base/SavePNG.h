@@ -25,4 +25,5 @@
 namespace PNG
 {
 bool Save(const FrameBuffer& fb);
+bool Save(const FrameBuffer& fb, const std::string& path);
 }

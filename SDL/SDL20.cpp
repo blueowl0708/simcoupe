@@ -79,7 +79,7 @@ bool SDLTexture::Init()
 
     int x{}, y{};
     SDL_GetWindowPosition(m_window, &x, &y);
-    if (x == 0 && y == 0)
+    if (x == 0 && y == 0 && !GetOption(background))
         Input::AcquireMouse();
 
     return true;

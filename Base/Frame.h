@@ -30,7 +30,7 @@
 
 extern uint8_t pMemory[];
 
-enum { TURBO_BOOT = 0x01, TURBO_KEY = 0x02 };
+enum { TURBO_BOOT = 0x01, TURBO_KEY = 0x02, TURBO_REMOTE = 0x04 };
 
 namespace Frame
 {
@@ -55,6 +55,7 @@ void Sync();
 void Redraw();
 void SavePNG();
 void SaveSSX();
+const FrameBuffer& GetFrameBuffer();
 
 int Width();
 int Height();

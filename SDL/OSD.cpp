@@ -39,6 +39,18 @@ bool OSD::Init()
 #endif
 
     auto subsystems = SDL_INIT_AUDIO | SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_TIMER | SDL_INIT_JOYSTICK;
+
+    if (GetOption(headless))
+    {
+        // Dummy drivers: no window, no audio device, nothing taking focus
+        SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+        SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+        subsystems = SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_TIMER;
+    }
+    else if (GetOption(background))
+    {
+        SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
+    }
     if (SDL_Init(subsystems) < 0)
     {
         Message(MsgType::Error, "SDL init failed: {}", SDL_GetError());

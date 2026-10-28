@@ -417,6 +417,11 @@ void SaveSSX()
     save_ssx = true;
 }
 
+const FrameBuffer& GetFrameBuffer()
+{
+    return *pFrameBuffer;
+}
+
 void SetStatus(std::string&& str)
 {
     status_text = std::move(str);

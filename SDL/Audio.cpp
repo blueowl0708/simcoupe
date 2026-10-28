@@ -34,6 +34,10 @@ bool Audio::Init()
 {
     Exit();
 
+    // Headless runs are silent; Sound::FrameUpdate still keeps time
+    if (GetOption(headless))
+        return true;
+
     SDL_AudioSpec desired{};
     desired.freq = SAMPLE_FREQ;
     desired.format = AUDIO_S16LSB;
@@ -62,6 +66,9 @@ void Audio::Exit()
 
 float Audio::AddData(uint8_t* pData_, int len_bytes)
 {
+    if (!dev)
+        return 0.0f;
+
     SDL_QueueAudio(dev, pData_, len_bytes);
 
     auto buffer_frames = std::max(GetOption(latency), MIN_LATENCY_FRAMES);

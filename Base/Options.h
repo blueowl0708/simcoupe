@@ -133,6 +133,11 @@ struct Config
 
     bool exitonhalt = false;            // Quit when Z80 executes DI;HALT? (batch mode; not saved, same as autoboot)
 
+    bool remote = false;                // Enable ZRCP-style remote control? (not saved)
+    int remoteport = 10001;             // Remote control TCP port, on 127.0.0.1 (not saved)
+    bool headless = false;              // No window or audio; implies remote, ignores and never saves settings (not saved)
+    bool background = false;            // Show the window without taking focus (not saved)
+
     std::string fkeys =                 // Function key bindings
         "F1=InsertDisk1,SF1=EjectDisk1,AF1=NewDisk1,CF1=SaveDisk1,"
         "F2=InsertDisk2,SF2=EjectDisk2,AF2=NewDisk2,CF2=SaveDisk2,"

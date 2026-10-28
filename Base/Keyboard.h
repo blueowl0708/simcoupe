@@ -67,3 +67,8 @@ enum eHostMods
     HM_NONE = 0x00, HM_LSHIFT = 0x01, HM_RSHIFT = 0x02, HM_LCTRL = 0x04, HM_RCTRL = 0x08, HM_LALT = 0x10, HM_RALT = 0x20,
     HM_SHIFT = (HM_LSHIFT | HM_RSHIFT), HM_CTRL = (HM_LCTRL | HM_RCTRL), HM_ALT = (HM_LALT | HM_RALT)
 };
+
+namespace Keyboard
+{
+bool CharToSamKeys(int ch, eSamKey& mod, eSamKey& key);
+}
