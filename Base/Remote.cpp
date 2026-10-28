@@ -419,6 +419,7 @@ struct Request
 {
     std::vector<std::string> args;
     std::string rest;           // everything after the command name
+    std::string raw_rest;       // the same, keeping trailing spaces (for typed text)
     std::string out;
     bool in_action = false;     // run as a breakpoint action
     bool deferred = false;      // reply comes later
@@ -905,7 +906,7 @@ void cmd_send_keys_string(Request& req)
         return;
 
     // The text is the rest of the line after the delay, spaces included
-    auto text = req.rest.substr(req.rest.find(req.args[0]) + req.args[0].size() + 1);
+    auto text = req.raw_rest.substr(req.raw_rest.find(req.args[0]) + req.args[0].size() + 1);
     start_typing(req, ms, std::vector<int>(text.begin(), text.end()));
 }
 
@@ -1328,13 +1329,17 @@ const std::vector<Command> commands
 
 void execute(const std::string& line, Request& req)
 {
-    auto text = trim(line);
-    if (text.empty())
+    auto text = line;
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n'))
+        text.pop_back();
+    text.erase(0, std::min(text.find_first_not_of(" \t"), text.size()));
+    if (trim(text).empty())
         return;
 
     auto space = text.find_first_of(" \t");
     auto name = to_lower(text.substr(0, space));
-    req.rest = (space == std::string::npos) ? "" : trim(text.substr(space));
+    req.raw_rest = (space == std::string::npos) ? "" : text.substr(text.find_first_not_of(" \t", space));
+    req.rest = trim(req.raw_rest);
     req.args = split(req.rest);
 
     for (auto& cmd : commands)

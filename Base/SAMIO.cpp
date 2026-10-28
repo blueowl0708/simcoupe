@@ -144,7 +144,9 @@ bool Init()
         pMonoDac = std::make_unique<MonoDACDevice>();
         pStereoDac = std::make_unique<StereoDACDevice>();
 
-        pDallas->LoadState(OSD::MakeFilePath(PathType::Settings, "dallas"));
+        // Headless runs start from a clean clock, for repeatable tests
+        if (!GetOption(headless))
+            pDallas->LoadState(OSD::MakeFilePath(PathType::Settings, "dallas"));
 
         UpdateDrives();
         Tape::Insert(GetOption(tape));
@@ -186,7 +188,8 @@ void Exit(bool reinit)
         if (pFloppy2)
             SetOption(disk2, pFloppy2->DiskPath());
 
-        if (pDallas)
+        // Remote-controlled and headless runs leave the saved clock alone
+        if (pDallas && !GetOption(remote) && !GetOption(headless))
             pDallas->SaveState(OSD::MakeFilePath(PathType::Settings, "dallas"));
 
         SetOption(tape, Tape::GetPath());

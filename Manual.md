@@ -779,6 +779,12 @@ the configuration file:
                              2=detailed percentage, 3=detailed timings
     -status <bool>          Show status messages (default=yes)
 
+    -remote <bool>          Remote control on 127.0.0.1 (default=no)
+    -remoteport <int>       Remote control TCP port (default=10001)
+    -headless <bool>        No window, no audio, default settings; implies
+                             -remote 1 (default=no)
+    -background <bool>      Show the window without taking focus (default=no)
+
   Key:
     <bool>    0 or 1, true or false, yes or no
     <int>     an integer value in the range shown next to the parameter
@@ -790,6 +796,90 @@ To restore the defaults settings, close SimCoupe and delete the file:
   - `%APPDATA%\SimCoupe\SimCoupe.cfg`  [Windows]
   - `~/.simcouperc`  [Linux]
   - `~/Library/Preferences/SimCoupe Preferences`  [Mac OS X]
+
+## Remote Control
+
+SimCoupe can be driven by scripts over a local TCP socket, using a text protocol
+modelled on ZEsarUX's ZRCP: the same `command> ` prompt (`command@cpu-step> `
+while the emulation is stopped) and, where they make sense, the same command
+names and output formats. It only listens on 127.0.0.1.
+
+```
+    SimCoupe -remote 1                  window as usual, remote on port 10001
+    SimCoupe -headless 1                no window or audio (for automated tests)
+    SimCoupe -remote 1 -background 1    window shown without taking focus
+    SimCoupe -headless 1 disk.mgt       boot a disk headless
+```
+
+Headless mode uses the default settings (your configuration file isn't read),
+draws no on-screen status text, and never shows dialogs: messages go to stderr
+and to the breakpoint log. `save-screen` still works, from the frame buffer.
+With remote control or headless mode on, settings and the DALLAS clock state
+are never saved.
+
+Connect with any line-based TCP client (e.g. `nc 127.0.0.1 10001`), send one
+command per line, and read up to the next prompt. Only one client is served at
+a time; a new connection replaces the old one. `help` lists the commands and
+`help <command>` describes one.
+
+Numbers in command arguments are decimal unless written with an `H` suffix or a
+`0x`, `$`, `#` or `&` prefix. Breakpoint conditions and the `printe`/`putv`
+actions use the debugger's expression syntax (see "Numeric expressions"), where
+bare numbers are hex.
+
+Commands that need emulated time (`run-frames`, `cpu-step`, `run`,
+`send-keys-string`, `send-keys-ascii`) reply when they finish; further input
+waits until then. They keep running if the client disconnects.
+
+| Group | Commands |
+|---|---|
+| Session | `help`, `get-version`, `noop`, `quit`, `exit-emulator` |
+| CPU | `get-registers` (ZRCP format plus LMPR/HMPR/VMPR), `set-register reg=value ...` (also LMPR, HMPR, VMPR, BORDER), `enter-cpu-step`/`pause`, `exit-cpu-step`/`resume`, `cpu-step`, `run [instructions]`, `reset-cpu`, `hard-reset-cpu` (also clears RAM), `generate-nmi`, `get-tstates`, `disassemble [addr] [lines]` |
+| Speed | `run-frames [N]` (run N frames, then stop), `set-speed normal\|turbo\|percent` |
+| Memory | `read-memory addr [len]`, `write-memory addr byte ...`, `write-memory-raw addr hex`, `load-binary file addr [len]`, `save-binary file addr len`, `get-memory-zones`, `set-memory-zone n` |
+| Paging | `get-paging-state` (ports, mode, ROM/write-protect state and the page in each section) |
+| Keys | `send-keys-event key 1\|0`, `send-keys-string ms text`, `send-keys-ascii ms code ...`, `release-keys` |
+| Screen | `save-screen file.png`, `get-screen-mode` |
+| Disks | `insert-disk 1\|2 file [boot]`, `eject-disk [1\|2]` |
+| Breakpoints | `enable-breakpoints`, `disable-breakpoints`, `set-breakpoint`/`sb idx [cond]`, `set-breakpointaction`/`sba idx [action]`, `enable-breakpoint`/`eb idx`, `disable-breakpoint`/`db idx`, `get-breakpoints`, `set-membreakpoint addr type [len]`, `clear-membreakpoints`, `get-breakpoint-log`, `clear-breakpoint-log` |
+| Coverage | `cpu-code-coverage enabled yes\|no`, `clear`, `get`, `get-physical` |
+
+Memory zones: zone -1 (the default) is the CPU's current view of memory. Other
+zones are SimCoupe page numbers (0-31 internal RAM, 32 upwards external RAM,
+288/289 ROM0/ROM1); an address in a zone runs on into the following pages, so
+zone 0 gives linear access to all of internal RAM.
+
+Keys are injected into the keyboard matrix, so programs that scan the keyboard
+hardware see them, not just the ROM. `send-keys-event` takes a SAM key name
+(`shift`, `symbol`, `cntrl`, `return`, `space`, `escape`, `edit`, `inv`,
+`up`/`down`/`left`/`right`, `f0`-`f9`, `a`-`z`, `minus`, `plus`, `equals`,
+`quotes`, `semicolon`, `colon`, `comma`, `period`, `delete`, `tab`, `caps`) or
+a decimal ASCII code (so digit keys are 48-57). Keys typed with
+`send-keys-string` are held for `ms` milliseconds and released for the same
+time, rounded to 20ms frames. Remote keys are ignored while the floppy drive is
+running in turbo mode, as host keys are.
+
+Breakpoints (1-100) fire when their condition becomes true, as in ZEsarUX, and
+are only checked after `enable-breakpoints`. The default action stops the
+emulation (cpu-step mode) and logs `Breakpoint fired: <condition>`. Other
+actions log and carry on: `prints text`, `printe expr`, `printregs`,
+`putv expr`, or any other non-waiting command. Action output goes to an
+in-memory log read with `get-breakpoint-log`. Memory breakpoints (type 1 =
+read, 2 = write, 3 = both, 0 = clear) use addresses in the CPU's view and stop
+the emulation.
+
+Example session:
+```
+    send-keys-string 100 PRINT 2+3
+    send-keys-ascii 100 13
+    run-frames 10
+    save-screen /tmp/screen.png
+    enable-breakpoints
+    sb 1 PC=8000H
+    sba 1 printregs
+    run-frames 50
+    get-breakpoint-log
+```
 
 ---
 
