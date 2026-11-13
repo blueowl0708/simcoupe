@@ -892,7 +892,7 @@ continue.
 | Keys | `send-keys-event key 1\|0`, `send-keys-string ms text`, `send-keys-ascii ms code ...`, `release-keys` |
 | Screen | `save-screen file.png`, `get-screen-mode` |
 | Disks | `insert-disk 1\|2 file [boot]`, `eject-disk [1\|2]` |
-| Breakpoints | `enable-breakpoints`, `disable-breakpoints`, `set-breakpoint`/`sb idx [cond]`, `set-breakpointaction`/`sba idx [action]`, `enable-breakpoint`/`eb idx`, `disable-breakpoint`/`db idx`, `get-breakpoints`, `set-membreakpoint addr type [len]`, `clear-membreakpoints`, `set-portbreakpoint port type [mask]`, `clear-portbreakpoints`, `get-breakpoint-log`, `clear-breakpoint-log` |
+| Breakpoints | `enable-breakpoints`, `disable-breakpoints`, `set-breakpoint`/`sb idx [cond]`, `set-breakpointaction`/`sba idx [action]`, `enable-breakpoint`/`eb idx`, `disable-breakpoint`/`db idx`, `get-breakpoints`, `set-membreakpoint addr|page:offset type [len]`, `clear-membreakpoints`, `set-portbreakpoint port type [mask]`, `clear-portbreakpoints`, `get-breakpoint-log`, `clear-breakpoint-log` |
 | I/O log | `io-log enabled yes\|no`, `io-log filter [in\|out] [port[:mask] ...]`, `io-log get [count]`, `io-log clear` |
 | Coverage | `cpu-code-coverage enabled yes\|no`, `clear`, `get`, `get-physical` |
 
@@ -917,8 +917,29 @@ emulation (cpu-step mode) and logs `Breakpoint fired: <condition>`. Other
 actions log and carry on: `prints text`, `printe expr`, `printregs`,
 `putv expr`, or any other non-waiting command. Action output goes to an
 in-memory log read with `get-breakpoint-log`. Memory breakpoints (type 1 =
-read, 2 = write, 3 = both, 0 = clear) use addresses in the CPU's view and stop
-the emulation.
+read, 2 = write, 3 = both, 0 = clear) stop the emulation. `set-membreakpoint
+address type [length]` uses addresses in the CPU's view, so it also fires for
+any other page mapped at that address. `set-membreakpoint page:offset type
+[length]` watches a physical page wherever it is mapped (sections A to D, any
+paging), and never fires for a different page at the same CPU address. The
+location is written as `cpu-code-coverage get-physical` prints it: the page is
+`RAMnn` (00 to 1F, or fewer with 256K), `EXTnn` (00 to 3F per MB fitted, up to
+the configured external memory) or `ROM0`/`ROM1`, with `nn` in hex, and the
+offset is hex (0 to 3FFF; an `H` suffix, `0x` or `$` is accepted), for example
+`set-membreakpoint RAM0A:0123 2` or `set-membreakpoint EXT01:3F00 3 256`. The
+length must stay inside the page. A page that does not exist in the current
+configuration, an offset past the page, a bad type, and write types on ROM
+(writes to ROM are discarded unless the `romwrite` option is on) are errors.
+Ranges overlapping an existing one in the same kind (CPU or the same page)
+replace it; `get-breakpoints` lists them (`Memory RAM0A:0123H-0123H: write`).
+When one fires the waiting command replies `Memory breakpoint fired: write
+RAM0A:0123H via 8123H, instruction at 4003H`: the page and offset, the CPU
+address the page is mapped at when the check runs (the first section if it is
+mapped twice, `(unmapped)` if the instruction paged it out) and the address of
+the instruction that did the access (the emulation stops after it finishes, so
+PC is past it). The CPU-view form reports the same way. Unlike ZEsarUX, whose
+`set-membreakpoint` takes only a CPU address, the physical form is
+SAM-specific.
 
 Port I/O breakpoints and the I/O log. `set-portbreakpoint port type [mask]`
 stops the emulation on an IN (type 1), an OUT (2) or either (3); type 0 removes

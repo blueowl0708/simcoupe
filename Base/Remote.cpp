@@ -135,8 +135,10 @@ enum { MEMBP_NONE, MEMBP_READ, MEMBP_WRITE, MEMBP_READWRITE };
 struct MemBreakpoint
 {
     int from, to, type;
+    int page;               // -1: from/to are CPU addresses; else a SimCoupe page, from/to offsets in it
 };
 std::vector<MemBreakpoint> mem_breakpoints;
+uint16_t last_instr_pc;     // start of the instruction that ran last, for memory breakpoint stops
 
 // Port breakpoints: they match when (port & mask) == (bp.port & mask) and the direction fits
 enum { PORTBP_NONE, PORTBP_IN, PORTBP_OUT, PORTBP_INOUT };
@@ -612,6 +614,7 @@ void defer(Request& req, Wait type, int count)
     pending.owner = client_id;
     pending.queued = in_buf.size();
     req.deferred = true;
+    last_instr_pc = cpu.get_pc();
     update_trace();
 }
 
@@ -764,6 +767,7 @@ void cmd_enter_step(Request& req)
 void cmd_exit_step(Request&)
 {
     stopped = false;
+    last_instr_pc = cpu.get_pc();
 }
 
 void cmd_cpu_step(Request& req)
@@ -1326,7 +1330,10 @@ void cmd_get_breakpoints(Request& req)
     for (auto& mbp : mem_breakpoints)
     {
         static const char* types[] = { "", "read", "write", "read/write" };
-        req.out += fmt::format("Memory {:04X}H-{:04X}H: {}\n", mbp.from, mbp.to, types[mbp.type]);
+        if (mbp.page >= 0)
+            req.out += fmt::format("Memory {}:{:04X}H-{:04X}H: {}\n", Memory::PageDesc(mbp.page, true), mbp.from, mbp.to, types[mbp.type]);
+        else
+            req.out += fmt::format("Memory {:04X}H-{:04X}H: {}\n", mbp.from, mbp.to, types[mbp.type]);
     }
 
     for (auto& pbp : port_breakpoints)
@@ -1336,28 +1343,116 @@ void cmd_get_breakpoints(Request& req)
     }
 }
 
+// Parses a physical location, "page:offset" as printed by cpu-code-coverage get-physical: the
+// page is RAMnn, EXTnn or ROMn (the numbers in hex), the offset hex (0 to 3FFF)
+bool parse_physical(Request& req, const std::string& arg, int& page, int& offset)
+{
+    auto colon = arg.find(':');
+    auto name = to_lower(arg.substr(0, colon));
+    auto off = to_lower(arg.substr(colon + 1));
+
+    auto parse_hex = [](std::string str, int max) -> std::optional<int>
+    {
+        if (str.size() > 2 && str[0] == '0' && str[1] == 'x')
+            str = str.substr(2);
+        else if (!str.empty() && str[0] == '$')
+            str = str.substr(1);
+        else if (str.size() > 1 && str.back() == 'h')
+            str.pop_back();
+
+        if (str.empty() || str.size() > 8 || !std::all_of(str.begin(), str.end(), [](unsigned char c) { return std::isxdigit(c); }))
+            return std::nullopt;
+
+        auto value = std::stoll(str, nullptr, 16);
+        if (value > max)
+            return std::nullopt;
+        return static_cast<int>(value);
+    };
+
+    int base = -1;
+    if (name.compare(0, 3, "ram") == 0)
+        base = INTMEM;
+    else if (name.compare(0, 3, "ext") == 0)
+        base = EXTMEM;
+    else if (name.compare(0, 3, "rom") == 0)
+        base = ROM0;
+
+    auto number = (base < 0) ? std::optional<int>{} : parse_hex(name.substr(3), 0xffff);
+    if (!number)
+    {
+        req.out += fmt::format("Error. Invalid page (use RAMnn, EXTnn, ROM0 or ROM1, number in hex): {}\n", arg.substr(0, colon));
+        return false;
+    }
+
+    page = base + *number;
+    if (base == ROM0 ? (*number > 1) : (!zone_valid(page) || *number >= (base == INTMEM ? NUM_INTERNAL_PAGES : (ROM0 - EXTMEM))))
+    {
+        req.out += fmt::format("Error. No such page in this configuration: {}\n", arg.substr(0, colon));
+        return false;
+    }
+
+    auto off_value = parse_hex(off, 0xffffff);
+    if (!off_value || *off_value >= MEM_PAGE_SIZE)
+    {
+        req.out += fmt::format("Error. Offset out of range (0 to {:X}): {}\n", MEM_PAGE_SIZE - 1, arg.substr(colon + 1));
+        return false;
+    }
+
+    offset = *off_value;
+    return true;
+}
+
 void cmd_set_membreakpoint(Request& req)
 {
-    int addr = 0, type = 0, len = 1;
-    if (!need_args(req, 2) || !get_number(req, 0, addr) || !get_number(req, 1, type))
+    static const char* usage = "Error. Usage: set-membreakpoint address|page:offset type(0-3) [length]\n";
+
+    int addr = 0, type = 0, len = 1, page = -1;
+    if (!need_args(req, 2) || !get_number(req, 1, type))
         return;
+
+    if (req.args[0].find(':') != std::string::npos)
+    {
+        if (!parse_physical(req, req.args[0], page, addr))
+            return;
+    }
+    else if (!get_number(req, 0, addr))
+        return;
+
     if (req.args.size() > 2 && !get_number(req, 2, len))
         return;
 
-    if (type < MEMBP_NONE || type > MEMBP_READWRITE || len < 1 || len > 0x10000 || addr < 0 || addr > 0xffff)
+    auto limit = (page >= 0) ? MEM_PAGE_SIZE : 0x10000;
+    if (type < MEMBP_NONE || type > MEMBP_READWRITE || len < 1 || len > 0x10000 || addr < 0 || addr >= limit)
     {
-        req.out += "Error. Usage: set-membreakpoint address type(0-3) [length]\n";
+        req.out += usage;
         return;
     }
 
-    auto to = std::min(addr + len - 1, 0xffff);
+    // Writes to ROM are discarded by the hardware, so can never be seen (unless ROM writes are enabled)
+    if (page >= ROM0 && (type & MEMBP_WRITE) && !GetOption(romwrite))
+    {
+        req.out += "Error. ROM can't be written, so only read breakpoints (type 1) are possible\n";
+        return;
+    }
 
-    // Replace any overlapping ranges
+    if (addr + len > limit)
+    {
+        req.out += (page >= 0) ? "Error. Length runs past the end of the page\n" : usage;
+        return;
+    }
+
+    auto to = addr + len - 1;
+
+    // Replace any overlapping ranges in the same address space
     mem_breakpoints.erase(std::remove_if(mem_breakpoints.begin(), mem_breakpoints.end(),
-        [&](auto& mbp) { return mbp.from <= to && mbp.to >= addr; }), mem_breakpoints.end());
+        [&](auto& mbp) { return mbp.page == page && mbp.from <= to && mbp.to >= addr; }), mem_breakpoints.end());
 
     if (type != MEMBP_NONE)
-        mem_breakpoints.push_back({ addr, to, type });
+        mem_breakpoints.push_back({ addr, to, type, page });
+
+    // Accesses from before the breakpoint was set must not count
+    Memory::last_phys_read1 = Memory::last_phys_read2 = nullptr;
+    Memory::last_phys_write1 = Memory::last_phys_write2 = nullptr;
 
     update_trace();
 }
@@ -1695,7 +1790,7 @@ const std::vector<Command> commands
     { "enable-breakpoint", "eb", "index", "Enables one breakpoint", cmd_enable_breakpoint },
     { "disable-breakpoint", "db", "index", "Disables one breakpoint", cmd_disable_breakpoint },
     { "get-breakpoints", "gb", "", "Lists breakpoints", cmd_get_breakpoints },
-    { "set-membreakpoint", nullptr, "address type [length]", "Stops on memory access in the CPU's view: type 0 = clear, 1 = read, 2 = write, 3 = read/write", cmd_set_membreakpoint },
+    { "set-membreakpoint", nullptr, "address|page:offset type [length]", "Stops on memory access: type 0 = clear, 1 = read, 2 = write, 3 = read/write. An address is in the CPU's view; page:offset (RAM05:0100, EXT00:3FFF, ROM0:0000, offset in hex) is physical, wherever the page is mapped", cmd_set_membreakpoint },
     { "clear-membreakpoints", nullptr, "", "Clears all memory breakpoints", cmd_clear_membreakpoints },
     { "set-portbreakpoint", nullptr, "port type [mask]", "Stops on port I/O: type 0 = clear, 1 = in, 2 = out, 3 = both; port is a number or a name (lmpr, hmpr, vmpr, border ...); a port matches when (port & mask) equals the given one (default mask FFH, or FFFFH for a port above FFH). Checked after enable-breakpoints", cmd_set_portbreakpoint },
     { "clear-portbreakpoints", nullptr, "", "Clears all port breakpoints", cmd_clear_portbreakpoints },
@@ -1760,21 +1855,35 @@ bool mem_breakpoint_hit(const uint8_t* phys, int type)
     if (!phys)
         return false;
 
-    for (int section = 0; section < 4; ++section)
+    auto page = PtrPage(phys);
+    auto offset = PtrOffset(phys);
+
+    for (auto& mbp : mem_breakpoints)
     {
-        auto addr = section * MEM_PAGE_SIZE + PtrOffset(phys);
-        if (AddrPage(static_cast<uint16_t>(addr)) != PtrPage(phys))
+        if (!(mbp.type & type))
             continue;
 
-        for (auto& mbp : mem_breakpoints)
+        // The CPU address the page is mapped at, if any (the first one if it is mapped twice)
+        int addr = -1;
+        for (int section = 0; section < 4; ++section)
         {
-            if ((mbp.type & type) && addr >= mbp.from && addr <= mbp.to)
-            {
-                stop_with(fmt::format("Memory breakpoint fired: {} {:04X}H",
-                    (type == MEMBP_READ) ? "read" : "write", addr));
-                return true;
-            }
+            auto a = section * MEM_PAGE_SIZE + offset;
+            if (AddrPage(static_cast<uint16_t>(a)) != page)
+                continue;
+            if (mbp.page < 0 && (a < mbp.from || a > mbp.to))
+                continue;
+
+            addr = a;
+            break;
         }
+
+        if (mbp.page < 0 ? (addr < 0) : (page != mbp.page || offset < mbp.from || offset > mbp.to))
+            continue;
+
+        stop_with(fmt::format("Memory breakpoint fired: {} {}:{:04X}H via {}, instruction at {:04X}H",
+            (type == MEMBP_READ) ? "read" : "write", Memory::PageDesc(page, true), offset,
+            (addr < 0) ? std::string("(unmapped)") : fmt::format("{:04X}H", addr), last_instr_pc));
+        return true;
     }
 
     return false;
@@ -2069,6 +2178,7 @@ bool OnInstruction()
         Memory::last_phys_write1 = Memory::last_phys_write2 = nullptr;
     }
 
+    last_instr_pc = cpu.get_pc();
     return stop;
 }
 
