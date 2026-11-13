@@ -219,8 +219,9 @@ void UI::ShowMessage(MsgType type, const std::string& str)
 {
     constexpr auto caption = "SimCoupe";
 
-    // Headless: no dialogs, which would stall the emulation unseen
-    if (GetOption(headless))
+    // Headless: no dialogs, which would stall the emulation unseen.
+    // Stopped by remote control: a dialog can't open, so don't lose the message.
+    if (GetOption(headless) || Remote::IsStopped())
     {
         fprintf(stderr, "%s\n", str.c_str());
         Remote::Log(str);

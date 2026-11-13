@@ -29,9 +29,11 @@
 #include "Remote.h"
 
 #include "CPU.h"
+#include "Debug.h"
 #include "Disassem.h"
 #include "Expr.h"
 #include "Frame.h"
+#include "GUI.h"
 #include "Keyboard.h"
 #include "Memory.h"
 #include "Options.h"
@@ -504,6 +506,21 @@ bool get_number_range(Request& req, size_t index, int& value, int lo, int hi)
     return true;
 }
 
+// The window's own GUI (the debugger or a dialog) holds the emulation while it's open, and
+// upstream's pause holds it until a key is pressed in the window. A command that waits for
+// the emulation to run would never finish, and stopping it would leave the GUI undrawn.
+bool held_by_window(Request& req)
+{
+    if (GUI::IsActive())
+        req.out += "Error. The emulator's debugger or a dialog is open in its window\n";
+    else if (g_fPaused)
+        req.out += "Error. The emulator is paused (press a key in its window)\n";
+    else
+        return false;
+
+    return true;
+}
+
 bool can_defer(Request& req)
 {
     if (req.in_action)
@@ -511,7 +528,7 @@ bool can_defer(Request& req)
         req.out += "Error. Not allowed in a breakpoint action\n";
         return false;
     }
-    return true;
+    return !held_by_window(req);
 }
 
 void defer(Request& req, Wait type, int count)
@@ -658,6 +675,12 @@ void cmd_set_register(Request& req)
 
 void cmd_enter_step(Request& req)
 {
+    if (GUI::IsActive())
+    {
+        held_by_window(req);
+        return;
+    }
+
     stopped = true;
     if (!req.in_action)
         Log("Entered cpu-step mode");
@@ -1384,11 +1407,11 @@ const std::vector<Command> commands
 
     { "get-registers", "gr", "", "Shows the CPU registers and SAM paging ports", cmd_get_registers },
     { "set-register", "sr", "reg=value ...", "Sets registers (PC, SP, AF ... IX, I, R, IM, IFF1, IFF2) or the LMPR, HMPR, VMPR and BORDER ports", cmd_set_register },
-    { "enter-cpu-step", "pause", "", "Stops the emulation (cpu-step mode)", cmd_enter_step },
+    { "enter-cpu-step", "pause", "", "Stops the emulation (cpu-step mode); an error while the window's debugger or a dialog is open", cmd_enter_step },
     { "exit-cpu-step", "resume", "", "Resumes the emulation", cmd_exit_step },
-    { "cpu-step", "cs", "", "Runs one instruction, then shows the registers", cmd_cpu_step },
-    { "run", nullptr, "[instructions]", "Runs until a breakpoint fires, the client sends anything (or a new client does), or after the given number of instructions (0 = no limit); then stops", cmd_run },
-    { "run-frames", "rf", "[frames]", "Runs the given number of frames (default 1), then stops; a breakpoint or any input from a client stops it early", cmd_run_frames },
+    { "cpu-step", "cs", "", "Runs one instruction, then shows the registers; an error while the window's debugger, a dialog or its pause holds the emulation", cmd_cpu_step },
+    { "run", nullptr, "[instructions]", "Runs until a breakpoint fires, the client sends anything (or a new client does), or after the given number of instructions (0 = no limit); then stops. An error while the window's debugger, a dialog or its pause holds the emulation, and one opening ends it", cmd_run },
+    { "run-frames", "rf", "[frames]", "Runs the given number of frames (default 1), then stops; a breakpoint, any input from a client, or the window's debugger, a dialog or its pause stops it early (an error if one is already open)", cmd_run_frames },
     { "reset-cpu", nullptr, "", "Resets the SAM", cmd_reset },
     { "hard-reset-cpu", nullptr, "", "Clears RAM and resets the SAM", cmd_hard_reset },
     { "generate-nmi", nullptr, "", "Generates an NMI", cmd_nmi },
@@ -1406,8 +1429,8 @@ const std::vector<Command> commands
     { "get-paging-state", nullptr, "", "Shows the paging ports and the page in each 16K section", cmd_get_paging_state },
 
     { "send-keys-event", nullptr, "key 1|0", "Presses (1) or releases (0) a key: a SAM key name (shift, symbol, cntrl, return, up, f1, ...) or a decimal ASCII code", cmd_send_keys_event },
-    { "send-keys-string", nullptr, "ms text", "Types text (spaces included, even if it is only spaces), holding each key for ms milliseconds (0-3600000, rounded to 20ms frames)", cmd_send_keys_string },
-    { "send-keys-ascii", nullptr, "ms code [code ...]", "Types decimal ASCII codes 0-255 (13 = Return)", cmd_send_keys_ascii },
+    { "send-keys-string", nullptr, "ms text", "Types text (spaces included, even if it is only spaces), holding each key for ms milliseconds (0-3600000, rounded to 20ms frames); not while the window's debugger, a dialog or its pause holds the emulation", cmd_send_keys_string },
+    { "send-keys-ascii", nullptr, "ms code [code ...]", "Types decimal ASCII codes 0-255 (13 = Return); not while the window's debugger, a dialog or its pause holds the emulation", cmd_send_keys_ascii },
     { "release-keys", nullptr, "", "Releases all keys pressed with send-keys-event", cmd_release_keys },
 
     { "save-screen", nullptr, "file.png", "Saves the current frame as a PNG (works headless)", cmd_save_screen },
@@ -1589,8 +1612,32 @@ void check_interrupt()
     stop_with(message);
 }
 
+// The window's GUI or pause took the emulation while a command waited for it (F10, the
+// debugger key, one of the debugger's own breakpoints): end the wait with a reply saying so.
+// The window owns the emulation from then on, and it runs again once the GUI closes or the
+// pause ends.
+void check_window()
+{
+    if (pending.type == Wait::None || (!GUI::IsActive() && !g_fPaused))
+        return;
+
+    auto by = Debug::IsActive() ? "debugger" : GUI::IsActive() ? "dialog" : "pause";
+    auto message = fmt::format("Interrupted by the emulator's {} at PC={:04X}H", by, cpu.get_pc());
+    if (pending.type == Wait::Frames)
+        message += fmt::format(" after {} of {} frames", pending.total - pending.count, pending.total);
+
+    Log(message);
+    stopped = false;
+
+    if (pending.type == Wait::Typing)
+        stop_typing();
+
+    complete(message + "\n");
+}
+
 void process_input()
 {
+    check_window();
     check_interrupt();
 
     while (pending.type == Wait::None && client_socket != INVALID_SOCKET && !close_after_flush)
@@ -1679,6 +1726,12 @@ bool IsActive()
 bool IsStopped()
 {
     return stopped && pending.type == Wait::None;
+}
+
+void ShowStopped()
+{
+    Frame::SetStatus("Stopped by remote control");
+    Frame::End();
 }
 
 void Poll()

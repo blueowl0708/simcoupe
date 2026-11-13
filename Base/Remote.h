@@ -29,6 +29,10 @@ void Poll();
 bool IsActive();
 bool IsStopped();
 
+// Say on the status line that remote control has stopped the emulation, and redraw the
+// frame so it shows (for the window's GUI and keys, which can't do anything until resumed)
+void ShowStopped();
+
 // Per-instruction hook, only called while trace_instructions is set.
 // Returns true if execution should stop before the next instruction.
 bool OnInstruction();

@@ -36,6 +36,7 @@
 #include "Frame.h"
 #include "Input.h"
 #include "Keyboard.h"
+#include "Remote.h"
 #include "Sound.h"
 #include "UI.h"
 #include "Video.h"
@@ -116,8 +117,12 @@ bool GUI::SendMessage(int nMessage_, int nParam1_/*=0*/, int nParam2_/*=0*/)
 bool GUI::Start(Window* pGUI_)
 {
     // Reject the new GUI if it's already running, or if the emulator is paused
-    if (s_pGUI || g_fPaused)
+    // or stopped by remote control (which skips the frame drawing the GUI)
+    if (s_pGUI || g_fPaused || Remote::IsStopped())
     {
+        if (!s_pGUI && !g_fPaused)
+            Remote::ShowStopped();
+
         // Delete the supplied object tree and return failure
         delete pGUI_;
         return false;

@@ -29,6 +29,7 @@
 #include "Keyboard.h"
 #include "Options.h"
 #include "Mouse.h"
+#include "Remote.h"
 #include "Video.h"
 
 //#define USE_JOYPOLLING
@@ -229,6 +230,10 @@ bool Input::FilterEvent(SDL_Event* pEvent_)
         // Unpause on key press if paused, so the user doesn't think we've hung
         if (fPress && g_fPaused && nKey != HK_PAUSE)
             Actions::Do(Action::Pause);
+
+        // Show why nothing happens if remote control has stopped the emulation
+        if (fPress && Remote::IsStopped())
+            Remote::ShowStopped();
 
         // Use key repeats for GUI mode only
         if (fKeyboardActive == GUI::IsActive())

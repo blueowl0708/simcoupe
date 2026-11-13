@@ -865,6 +865,23 @@ stops a run left by a previous client too; that client gets no reply for it, as
 it didn't send the run, but the stop is in the breakpoint log. A disconnect
 alone doesn't stop a run.
 
+With a window (`-remote 1` without `-headless`), only one side drives the
+emulation at a time, the same way as SimCoupe's own pause. While remote control
+has the emulation stopped (cpu-step mode), the debugger, the Options dialog and
+the other dialogs don't open, and a key press in the window shows
+"Stopped by remote control" on the status line instead; keys reach the SAM again
+once the client resumes. While the window's debugger or a dialog is open, or the
+emulator is paused, `run`, `run-frames` (also `run-frames 0`), `cpu-step`,
+`send-keys-string` and `send-keys-ascii` reply
+`Error. The emulator's debugger or a dialog is open in its window` (or
+`Error. The emulator is paused (press a key in its window)`), and so does
+`enter-cpu-step` while the debugger or a dialog is open. If the debugger or a
+dialog opens, or the emulator is paused, while one of those commands is waiting,
+it ends with `Interrupted by the emulator's debugger|dialog|pause at PC=xxxxH`
+(for `run-frames`, followed by `after N of M frames`), also logged; the
+emulation is then left running (not in cpu-step mode) once the window lets it
+continue.
+
 | Group | Commands |
 |---|---|
 | Session | `help`, `get-version`, `noop`, `quit`, `exit-emulator` |
