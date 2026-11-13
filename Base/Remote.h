@@ -38,6 +38,10 @@ void ShowStopped();
 bool OnInstruction();
 void OnFrameEnd();
 
+// Called for every I/O instruction while io_hooks is set (the I/O log is on, or port
+// breakpoints are set and checked). Sets g_fBreak if a port breakpoint stops the emulation.
+void OnIO(uint16_t port, uint8_t value, bool is_out);
+
 // Merge keys pressed by remote commands into the SAM keyboard matrix
 void ApplyKeys(std::array<uint8_t, 9>& key_matrix);
 
@@ -45,4 +49,5 @@ void ApplyKeys(std::array<uint8_t, 9>& key_matrix);
 void Log(const std::string& str);
 
 extern bool trace_instructions;
+extern bool io_hooks;
 }

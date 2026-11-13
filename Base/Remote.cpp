@@ -78,11 +78,15 @@ constexpr auto PROMPT = "command> ";
 constexpr auto STEP_PROMPT = "command@cpu-step> ";
 constexpr auto MAX_BREAKPOINTS = 100;
 constexpr size_t MAX_LOG_LINES = 100000;
+constexpr auto MAX_PORT_BREAKPOINTS = 100;
+constexpr size_t MAX_IO_LOG = 100000;
+constexpr size_t MAX_IO_FILTERS = 64;
 constexpr int MS_PER_FRAME = 20;
 
 namespace Remote
 {
 bool trace_instructions;
+bool io_hooks;
 
 namespace
 {
@@ -133,6 +137,34 @@ struct MemBreakpoint
     int from, to, type;
 };
 std::vector<MemBreakpoint> mem_breakpoints;
+
+// Port breakpoints: they match when (port & mask) == (bp.port & mask) and the direction fits
+enum { PORTBP_NONE, PORTBP_IN, PORTBP_OUT, PORTBP_INOUT };
+struct PortBreakpoint
+{
+    int port, mask, type;
+};
+std::vector<PortBreakpoint> port_breakpoints;
+
+// The I/O log: records matching I/O without stopping, oldest entries dropped when full
+struct IoFilter
+{
+    int port, mask;
+};
+struct IoEntry
+{
+    uint64_t frame;
+    uint32_t cycle;
+    uint16_t pc, port;
+    uint8_t value;
+    bool is_out;
+};
+bool io_log_enabled;
+std::vector<IoFilter> io_filters;       // empty = every port
+bool io_filter_in = true, io_filter_out = true;
+std::deque<IoEntry> io_log;
+uint64_t io_dropped;
+uint64_t frame_count;                   // frames run since start-up
 
 std::deque<std::string> log_lines;
 
@@ -399,6 +431,8 @@ void update_trace()
     trace_instructions = coverage_enabled || any_breakpoints ||
         (breakpoints_enabled && !mem_breakpoints.empty()) ||
         pending.type == Wait::Instructions || (pending.type == Wait::Break && pending.count);
+
+    io_hooks = io_log_enabled || (breakpoints_enabled && !port_breakpoints.empty());
 }
 
 void send(const std::string& str)
@@ -506,6 +540,46 @@ bool get_number_range(Request& req, size_t index, int& value, int lo, int hi)
     return true;
 }
 
+// Names accepted wherever a port number is (the low byte of the port: most SAM ports ignore
+// the high byte). Shared by set-register (the ones marked settable) and the port commands.
+struct PortName
+{
+    const char* name;
+    uint8_t port;
+    bool settable;
+};
+const std::vector<PortName> port_names
+{
+    { "kempston", KEMPSTON_PORT, false }, { "lepr", LEPR_PORT, false }, { "hepr", HEPR_PORT, false },
+    { "clock", CLOCK_PORT, false }, { "lpen", LPEN_PORT, false }, { "clut", CLUT_BASE_PORT, false },
+    { "status", STATUS_PORT, false }, { "line", LINE_PORT, false },
+    { "lmpr", LMPR_PORT, true }, { "hmpr", HMPR_PORT, true }, { "vmpr", VMPR_PORT, true },
+    { "midi", MIDI_PORT, false }, { "border", BORDER_PORT, true }, { "keyboard", KEYBOARD_PORT, false },
+    { "attr", ATTR_PORT, false }, { "saa", SAA_PORT, false },
+};
+
+const PortName* find_port_name(const std::string& name)
+{
+    auto lname = to_lower(name);
+    for (auto& pn : port_names)
+    {
+        if (lname == pn.name)
+            return &pn;
+    }
+    return nullptr;
+}
+
+// Reads a port argument: a name from the table above, or a number 0-FFFFH
+bool get_port(Request& req, size_t index, int& port)
+{
+    if (auto pn = find_port_name(req.args[index]))
+    {
+        port = pn->port;
+        return true;
+    }
+    return get_number_range(req, index, port, 0, 0xffff);
+}
+
 // The window's own GUI (the debugger or a dialog) holds the emulation while it's open, and
 // upstream's pause holds it until a key is pressed in the window. A command that waits for
 // the emulation to run would never finish, and stopping it would leave the GUI undrawn.
@@ -608,9 +682,10 @@ void cmd_set_register(Request& req)
         {"i", Expr::Token::I}, {"r", Expr::Token::R}, {"im", Expr::Token::IM},
         {"iff1", Expr::Token::IFF1}, {"iff2", Expr::Token::IFF2},
     };
-    static const std::map<std::string, uint8_t> ports
+    auto settable_port = [](const std::string& name) -> const PortName*
     {
-        {"lmpr", LMPR_PORT}, {"hmpr", HMPR_PORT}, {"vmpr", VMPR_PORT}, {"border", BORDER_PORT},
+        auto pn = find_port_name(name);
+        return (pn && pn->settable) ? pn : nullptr;
     };
 
     auto max_value = [](const std::string& name)
@@ -640,7 +715,7 @@ void cmd_set_register(Request& req)
             return;
         }
 
-        if (!regs.count(name) && !ports.count(name))
+        if (!regs.count(name) && !settable_port(name))
         {
             req.out += fmt::format("Error. Unknown register: {}\n", name);
             return;
@@ -666,8 +741,8 @@ void cmd_set_register(Request& req)
 
         if (auto it = regs.find(name); it != regs.end())
             Expr::SetReg(it->second, *value);
-        else if (auto port = ports.find(name); port != ports.end())
-            IO::Out(port->second, static_cast<uint8_t>(*value));
+        else if (auto port = settable_port(name))
+            IO::Out(port->port, static_cast<uint8_t>(*value));
     }
 
     req.out += registers_string() + "\n";
@@ -1253,6 +1328,12 @@ void cmd_get_breakpoints(Request& req)
         static const char* types[] = { "", "read", "write", "read/write" };
         req.out += fmt::format("Memory {:04X}H-{:04X}H: {}\n", mbp.from, mbp.to, types[mbp.type]);
     }
+
+    for (auto& pbp : port_breakpoints)
+    {
+        static const char* types[] = { "", "in", "out", "in/out" };
+        req.out += fmt::format("Port {:04X}H mask {:04X}H: {}\n", pbp.port, pbp.mask, types[pbp.type]);
+    }
 }
 
 void cmd_set_membreakpoint(Request& req)
@@ -1284,6 +1365,48 @@ void cmd_set_membreakpoint(Request& req)
 void cmd_clear_membreakpoints(Request&)
 {
     mem_breakpoints.clear();
+    update_trace();
+}
+
+void cmd_set_portbreakpoint(Request& req)
+{
+    int port = 0, type = 0, mask = 0;
+    if (!need_args(req, 2) || !get_port(req, 0, port) || !get_number(req, 1, type))
+        return;
+
+    if (type < PORTBP_NONE || type > PORTBP_INOUT)
+    {
+        req.out += "Error. Usage: set-portbreakpoint port type(0-3) [mask]\n";
+        return;
+    }
+
+    // Most SAM ports are decoded from the low byte only, so a port below 100H matches on that
+    mask = (port <= 0xff) ? 0xff : 0xffff;
+    if (req.args.size() > 2 && !get_number_range(req, 2, mask, 0, 0xffff))
+        return;
+
+    port &= mask;
+
+    // Replace any breakpoint with the same port and mask
+    port_breakpoints.erase(std::remove_if(port_breakpoints.begin(), port_breakpoints.end(),
+        [&](auto& pbp) { return pbp.port == port && pbp.mask == mask; }), port_breakpoints.end());
+
+    if (type != PORTBP_NONE)
+    {
+        if (port_breakpoints.size() >= MAX_PORT_BREAKPOINTS)
+        {
+            req.out += fmt::format("Error. At most {} port breakpoints\n", MAX_PORT_BREAKPOINTS);
+            return;
+        }
+        port_breakpoints.push_back({ port, mask, type });
+    }
+
+    update_trace();
+}
+
+void cmd_clear_portbreakpoints(Request&)
+{
+    port_breakpoints.clear();
     update_trace();
 }
 
@@ -1397,6 +1520,132 @@ void cmd_coverage(Request& req)
     }
 }
 
+bool is_yes(const std::string& arg, bool& yes)
+{
+    auto a = to_lower(arg);
+    if (a == "yes" || a == "1" || a == "true")
+        yes = true;
+    else if (a == "no" || a == "0" || a == "false")
+        yes = false;
+    else
+        return false;
+    return true;
+}
+
+// Parses a filter token: port[:mask], the port a name or number (see get_port)
+bool get_io_filter(Request& req, const std::string& token, IoFilter& filter)
+{
+    auto colon = token.find(':');
+
+    Request sub;
+    sub.args = { token.substr(0, colon) };
+    int port = 0, mask = 0xffff;
+    bool ok = get_port(sub, 0, port);
+
+    if (ok && colon != std::string::npos)
+    {
+        sub.args = { token.substr(colon + 1) };
+        ok = get_number_range(sub, 0, mask, 0, 0xffff);
+    }
+    else if (ok)
+    {
+        mask = (port <= 0xff) ? 0xff : 0xffff;
+    }
+
+    req.out += sub.out;
+    filter = { port & mask, mask };
+    return ok;
+}
+
+std::string io_filter_string()
+{
+    std::string s = io_filter_in ? (io_filter_out ? "in/out" : "in") : "out";
+    if (io_filters.empty())
+        return s + " all ports";
+
+    for (auto& f : io_filters)
+        s += fmt::format(" {:04X}H:{:04X}H", f.port, f.mask);
+    return s;
+}
+
+void cmd_io_log(Request& req)
+{
+    if (!need_args(req, 1))
+        return;
+
+    auto action = to_lower(req.args[0]);
+    if (action == "enabled")
+    {
+        bool yes;
+        if (!need_args(req, 2))
+            return;
+        if (!is_yes(req.args[1], yes))
+        {
+            req.out += "Error. Use enabled yes|no\n";
+            return;
+        }
+
+        io_log_enabled = yes;
+        update_trace();
+    }
+    else if (action == "filter")
+    {
+        // Check everything before changing anything
+        std::vector<IoFilter> filters;
+        bool in = true, out = true;
+        for (size_t i = 1; i < req.args.size(); ++i)
+        {
+            auto arg = to_lower(req.args[i]);
+            if (arg == "in" || arg == "out")
+            {
+                in = (arg == "in");
+                out = !in;
+                continue;
+            }
+
+            IoFilter filter;
+            if (!get_io_filter(req, req.args[i], filter))
+                return;
+            if (filters.size() >= MAX_IO_FILTERS)
+            {
+                req.out += fmt::format("Error. At most {} ports in a filter\n", MAX_IO_FILTERS);
+                return;
+            }
+            filters.push_back(filter);
+        }
+
+        io_filters = filters;
+        io_filter_in = in;
+        io_filter_out = out;
+    }
+    else if (action == "get")
+    {
+        int count = static_cast<int>(MAX_IO_LOG);
+        if (req.args.size() > 1 && !get_number_range(req, 1, count, 1, static_cast<int>(MAX_IO_LOG)))
+            return;
+
+        size_t first = io_log.size() - std::min(io_log.size(), static_cast<size_t>(count));
+        req.out += fmt::format("I/O log {}: {} entries, {} dropped, filter: {}\n", io_log_enabled ? "on" : "off",
+            io_log.size(), io_dropped, io_filter_string());
+
+        for (size_t i = first; i < io_log.size(); ++i)
+        {
+            auto& e = io_log[i];
+            req.out += fmt::format("frame={} cycle={} pc={:04X}H {} port={:04X}H value={:02X}H\n",
+                e.frame, e.cycle, e.pc, e.is_out ? "out" : "in", e.port, e.value);
+        }
+    }
+    else if (action == "clear")
+    {
+        io_log.clear();
+        io_dropped = 0;
+    }
+    else
+    {
+        req.out += "Error. Use enabled yes|no, filter [in|out] [port[:mask] ...], get [count] or clear\n";
+    }
+}
+
 const std::vector<Command> commands
 {
     { "help", "?", "[command]", "Lists commands, or shows help for one", cmd_help },
@@ -1448,6 +1697,9 @@ const std::vector<Command> commands
     { "get-breakpoints", "gb", "", "Lists breakpoints", cmd_get_breakpoints },
     { "set-membreakpoint", nullptr, "address type [length]", "Stops on memory access in the CPU's view: type 0 = clear, 1 = read, 2 = write, 3 = read/write", cmd_set_membreakpoint },
     { "clear-membreakpoints", nullptr, "", "Clears all memory breakpoints", cmd_clear_membreakpoints },
+    { "set-portbreakpoint", nullptr, "port type [mask]", "Stops on port I/O: type 0 = clear, 1 = in, 2 = out, 3 = both; port is a number or a name (lmpr, hmpr, vmpr, border ...); a port matches when (port & mask) equals the given one (default mask FFH, or FFFFH for a port above FFH). Checked after enable-breakpoints", cmd_set_portbreakpoint },
+    { "clear-portbreakpoints", nullptr, "", "Clears all port breakpoints", cmd_clear_portbreakpoints },
+    { "io-log", nullptr, "enabled yes|no | filter [in|out] [port[:mask] ...] | get [count] | clear", "Logs I/O without stopping (frame, cycle, instruction address, direction, port, value); filter limits it to the ports and direction given (none = all); get shows the newest entries and the number dropped (at most 100000 are kept)", cmd_io_log },
     { "get-breakpoint-log", nullptr, "", "Shows the log written by breakpoint actions and stops", cmd_get_breakpoint_log },
     { "clear-breakpoint-log", nullptr, "", "Clears the breakpoint log", cmd_clear_breakpoint_log },
     { "prints", nullptr, "text", "Adds text to the log", cmd_prints },
@@ -1820,8 +2072,48 @@ bool OnInstruction()
     return stop;
 }
 
+void OnIO(uint16_t port, uint8_t value, bool is_out)
+{
+    // The CPU has fetched the whole instruction (and operand), so its start is two bytes back:
+    // D3 n, DB n and the ED-prefixed forms, including a repeating block instruction
+    auto pc = static_cast<uint16_t>(cpu.get_pc() - 2);
+
+    if (io_log_enabled && (is_out ? io_filter_out : io_filter_in))
+    {
+        bool match = io_filters.empty();
+        for (auto& f : io_filters)
+            match |= (port & f.mask) == f.port;
+
+        if (match)
+        {
+            if (io_log.size() >= MAX_IO_LOG)
+            {
+                io_log.pop_front();
+                io_dropped++;
+            }
+            io_log.push_back({ frame_count, CPU::frame_cycles, pc, port, value, is_out });
+        }
+    }
+
+    if (breakpoints_enabled)
+    {
+        for (auto& pbp : port_breakpoints)
+        {
+            if ((pbp.type & (is_out ? PORTBP_OUT : PORTBP_IN)) && (port & pbp.mask) == pbp.port)
+            {
+                stop_with(fmt::format("Port breakpoint fired: {} {:04X}H value {:02X}H, instruction at {:04X}H",
+                    is_out ? "OUT" : "IN", port, value, pc));
+                g_fBreak = true;
+                return;
+            }
+        }
+    }
+}
+
 void OnFrameEnd()
 {
+    frame_count++;
+
     if (pending.type == Wait::Typing && --type_frames_left <= 0)
     {
         if (type_key_down)

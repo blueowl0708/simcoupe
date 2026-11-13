@@ -25,6 +25,7 @@
 #include "Debug.h"
 #include "Memory.h"
 #include "Options.h"
+#include "Remote.h"
 #include "SAM.h"
 #include "SAMIO.h"
 #include "Tape.h"
@@ -108,6 +109,10 @@ struct sam_cpu : public z80::z80_cpu<sam_cpu>
     {
         CPU::last_in_port = port;
         CPU::last_in_val = IO::In(port);
+
+        if (Remote::io_hooks)
+            Remote::OnIO(static_cast<uint16_t>(port), CPU::last_in_val, false);
+
         return CPU::last_in_val;
     }
 
@@ -115,6 +120,11 @@ struct sam_cpu : public z80::z80_cpu<sam_cpu>
     {
         CPU::last_out_port = port;
         CPU::last_out_val = val;
+
+        // Before the output, as it may change the paging the instruction address is read through
+        if (Remote::io_hooks)
+            Remote::OnIO(static_cast<uint16_t>(port), static_cast<uint8_t>(val), true);
+
         IO::Out(port, val);
     }
 

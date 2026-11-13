@@ -892,7 +892,8 @@ continue.
 | Keys | `send-keys-event key 1\|0`, `send-keys-string ms text`, `send-keys-ascii ms code ...`, `release-keys` |
 | Screen | `save-screen file.png`, `get-screen-mode` |
 | Disks | `insert-disk 1\|2 file [boot]`, `eject-disk [1\|2]` |
-| Breakpoints | `enable-breakpoints`, `disable-breakpoints`, `set-breakpoint`/`sb idx [cond]`, `set-breakpointaction`/`sba idx [action]`, `enable-breakpoint`/`eb idx`, `disable-breakpoint`/`db idx`, `get-breakpoints`, `set-membreakpoint addr type [len]`, `clear-membreakpoints`, `get-breakpoint-log`, `clear-breakpoint-log` |
+| Breakpoints | `enable-breakpoints`, `disable-breakpoints`, `set-breakpoint`/`sb idx [cond]`, `set-breakpointaction`/`sba idx [action]`, `enable-breakpoint`/`eb idx`, `disable-breakpoint`/`db idx`, `get-breakpoints`, `set-membreakpoint addr type [len]`, `clear-membreakpoints`, `set-portbreakpoint port type [mask]`, `clear-portbreakpoints`, `get-breakpoint-log`, `clear-breakpoint-log` |
+| I/O log | `io-log enabled yes\|no`, `io-log filter [in\|out] [port[:mask] ...]`, `io-log get [count]`, `io-log clear` |
 | Coverage | `cpu-code-coverage enabled yes\|no`, `clear`, `get`, `get-physical` |
 
 Memory zones: zone -1 (the default) is the CPU's current view of memory. Other
@@ -918,6 +919,47 @@ actions log and carry on: `prints text`, `printe expr`, `printregs`,
 in-memory log read with `get-breakpoint-log`. Memory breakpoints (type 1 =
 read, 2 = write, 3 = both, 0 = clear) use addresses in the CPU's view and stop
 the emulation.
+
+Port I/O breakpoints and the I/O log. `set-portbreakpoint port type [mask]`
+stops the emulation on an IN (type 1), an OUT (2) or either (3); type 0 removes
+the breakpoint. Like the other breakpoints they are only checked after
+`enable-breakpoints`, and `get-breakpoints` lists them (`Port 00FBH mask 00FFH:
+out`). A port is a number (decimal, or hex with an `H` suffix) or a name:
+`lmpr`, `hmpr`, `vmpr`, `border`, `keyboard`, `status`, `line`, `lpen`, `clut`,
+`lepr`, `hepr`, `midi`, `attr`, `saa`, `clock`, `kempston`; a name is the low
+byte of the port (`lmpr` = FAH), in any letter case. The SAM decodes most ports
+from the low byte only, so a breakpoint matches when `(port & mask)` equals
+`(breakpoint port & mask)`: the default mask is FFH for a port up to FFH (so
+`OUT (C),A` with BC=1FFBH matches `hmpr`) and FFFFH above it. Give a mask to
+match differently, for example `set-portbreakpoint 12FEH 2 FFFFH` for only that
+full port. A breakpoint with the same port and mask is replaced; at most 100.
+`clear-portbreakpoints` removes them all. When one fires the command that was
+waiting replies `Port breakpoint fired: OUT 00FBH value 1FH, instruction at
+EBBDH` and the emulation stops after that instruction finishes, so PC is
+already past it; the address in the message is the IN or OUT itself (for a
+repeating `INIR`/`OTIR` it is the instruction, once per transfer). The message
+is also added to the breakpoint log. A breakpoint action can't be set.
+
+`io-log` records I/O without stopping: `io-log enabled yes|no` turns it on or
+off, `io-log filter [in|out] [port[:mask] ...]` limits it to the given ports
+(a name or number, optionally with a mask, in the same way as for breakpoints:
+`io-log filter lmpr hmpr vmpr`) and to one direction (none given = every port,
+both directions; a new `filter` replaces the old one, and a bad one changes
+nothing), `io-log get [count]` shows the newest `count` entries (default all),
+and `io-log clear` empties the log and the dropped count. `get` starts with a
+line `I/O log on: 23 entries, 0 dropped, filter: ...` and then one line per
+entry, oldest first: `frame=355 cycle=113246 pc=EBBDH out port=00FBH value=00H`.
+`frame` counts frames run since SimCoupe started, `cycle` is the T-state in that
+frame at the I/O, `pc` is the address of the IN or OUT instruction, and `port`
+is the full 16-bit port the CPU put on the address bus (the high byte is
+whatever the program had in A or B). At most 100000 entries are kept: when full
+the oldest is dropped and counted, and the count shows in the header until the
+log is cleared. The log records what the CPU did, including I/O the emulated
+SAM ignores (for example to the ASIC ports while the ASIC is asleep). I/O done
+by the remote itself (`set-register lmpr=...`) or by the debugger is not
+logged. With the log off and no port breakpoints set, I/O costs nothing extra.
+Unlike ZEsarUX, which has no port breakpoint command, the names and the mask
+are SAM-specific.
 
 Example session:
 ```
