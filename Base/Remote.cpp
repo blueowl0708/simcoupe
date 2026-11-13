@@ -36,6 +36,10 @@
 #include "SAMIO.h"
 #include "SavePNG.h"
 
+#include <cerrno>
+#include <limits>
+#include <set>
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -188,12 +192,24 @@ std::optional<int> parse_number(std::string s)
     if (s.empty())
         return std::nullopt;
 
-    char* end{};
-    auto value = std::strtol(s.c_str(), &end, base);
-    if (*end)
+    // Digits only (strtoll would also accept spaces and signs here)
+    if (!std::isalnum(static_cast<unsigned char>(s[0])))
         return std::nullopt;
 
-    return static_cast<int>(negative ? -value : value);
+    char* end{};
+    errno = 0;
+    auto value = std::strtoll(s.c_str(), &end, base);
+    if (*end || errno == ERANGE)
+        return std::nullopt;
+
+    if (negative)
+        value = -value;
+
+    // Reject anything that doesn't fit an int, rather than wrapping
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max())
+        return std::nullopt;
+
+    return static_cast<int>(value);
 }
 
 std::string flags_string(uint8_t f)
@@ -259,11 +275,18 @@ uint8_t* zone_ptr(int addr)
     return PageReadPtr(page) + (addr % MEM_PAGE_SIZE);
 }
 
+// The shared bounds check for every command that reads, writes or saves a block of memory:
+// the block must lie inside the current zone (the 64K CPU view for zone -1) and be no longer
+// than MAX_LENGTH, so a client can never make us allocate or loop without limit.
+// Use this (or get_number_range for plain counts) for any number that comes from the client.
+constexpr int MAX_LENGTH = 0x1000000;
+
 bool zone_range_ok(int addr, int len, std::string& error)
 {
-    if (addr < 0 || len < 0 || (memory_zone != -1 && addr + len > zone_size(memory_zone)))
+    auto size = static_cast<int64_t>(zone_size(memory_zone));
+    if (addr < 0 || len < 0 || len > MAX_LENGTH || static_cast<int64_t>(addr) + len > size)
     {
-        error = "Error. Address out of range for this memory zone\n";
+        error += "Error. Address or length out of range for this memory zone\n";
         return false;
     }
     return true;
@@ -342,7 +365,7 @@ bool lookup_key(const std::string& str, eSamKey& mod, eSamKey& key)
         }
     }
 
-    if (auto code = parse_number(str))
+    if (auto code = parse_number(str); code && *code >= 0 && *code <= 255)
         return Keyboard::CharToSamKeys(*code, mod, key);
 
     return false;
@@ -462,6 +485,21 @@ bool get_number(Request& req, size_t index, int& value)
     return true;
 }
 
+// Reads a number argument and checks it lies in lo..hi
+bool get_number_range(Request& req, size_t index, int& value, int lo, int hi)
+{
+    int n;
+    if (!get_number(req, index, n))
+        return false;
+    if (n < lo || n > hi)
+    {
+        req.out += fmt::format("Error. Value out of range ({} to {}): {}\n", lo, hi, req.args[index]);
+        return false;
+    }
+    value = n;
+    return true;
+}
+
 bool can_defer(Request& req)
 {
     if (req.in_action)
@@ -553,6 +591,46 @@ void cmd_set_register(Request& req)
         {"lmpr", LMPR_PORT}, {"hmpr", HMPR_PORT}, {"vmpr", VMPR_PORT}, {"border", BORDER_PORT},
     };
 
+    auto max_value = [](const std::string& name)
+    {
+        static const std::set<std::string> regs16
+        {
+            "af", "bc", "de", "hl", "af'", "bc'", "de'", "hl'", "ix", "iy", "sp", "pc",
+        };
+        if (regs16.count(name))
+            return 0xffff;
+        if (name == "im")
+            return 2;
+        if (name == "iff1" || name == "iff2")
+            return 1;
+        return 0xff;
+    };
+
+    // Check every assignment before applying any, so a bad one changes nothing
+    for (auto& arg : req.args)
+    {
+        auto eq = arg.find('=');
+        auto name = to_lower(arg.substr(0, eq));
+        auto value = (eq == std::string::npos) ? std::nullopt : parse_number(arg.substr(eq + 1));
+        if (!value)
+        {
+            req.out += fmt::format("Error. Expected register=value: {}\n", arg);
+            return;
+        }
+
+        if (!regs.count(name) && !ports.count(name))
+        {
+            req.out += fmt::format("Error. Unknown register: {}\n", name);
+            return;
+        }
+
+        if (*value < 0 || *value > max_value(name))
+        {
+            req.out += fmt::format("Error. Value out of range (0 to {}): {}\n", max_value(name), arg.substr(eq + 1));
+            return;
+        }
+    }
+
     for (auto& arg : req.args)
     {
         auto eq = arg.find('=');
@@ -568,11 +646,6 @@ void cmd_set_register(Request& req)
             Expr::SetReg(it->second, *value);
         else if (auto port = ports.find(name); port != ports.end())
             IO::Out(port->second, static_cast<uint8_t>(*value));
-        else
-        {
-            req.out += fmt::format("Error. Unknown register: {}\n", name);
-            return;
-        }
     }
 
     req.out += registers_string() + "\n";
@@ -605,11 +678,11 @@ void cmd_run(Request& req)
         return;
 
     int limit = 0;
-    if (!req.args.empty() && !get_number(req, 0, limit))
+    if (!req.args.empty() && !get_number_range(req, 0, limit, 0, std::numeric_limits<int>::max()))
         return;
 
     stopped = false;
-    defer(req, Wait::Break, std::max(limit, 0));
+    defer(req, Wait::Break, limit);
 }
 
 void cmd_run_frames(Request& req)
@@ -618,7 +691,7 @@ void cmd_run_frames(Request& req)
         return;
 
     int frames = 1;
-    if (!req.args.empty() && !get_number(req, 0, frames))
+    if (!req.args.empty() && !get_number_range(req, 0, frames, 0, std::numeric_limits<int>::max()))
         return;
 
     if (frames <= 0)
@@ -703,7 +776,7 @@ void cmd_write_memory(Request& req)
     for (size_t i = 1; i < req.args.size(); ++i)
     {
         int value;
-        if (!get_number(req, i, value))
+        if (!get_number_range(req, i, value, -128, 255))
             return;
         data.push_back(static_cast<uint8_t>(value));
     }
@@ -751,9 +824,27 @@ void cmd_load_binary(Request& req)
         return;
     }
 
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    if (len > 0 && len < static_cast<int>(data.size()))
-        data.resize(len);
+    if (len < 0 || len > MAX_LENGTH)
+    {
+        req.out += "Error. Address or length out of range for this memory zone\n";
+        return;
+    }
+
+    // Read at most MAX_LENGTH + 1 bytes (or the requested length), so a huge file can't exhaust memory
+    // (sized from the file, so a small file doesn't cost a 16M buffer)
+    file.seekg(0, std::ios::end);
+    auto file_size = static_cast<int64_t>(file.tellg());
+    file.seekg(0, std::ios::beg);
+    if (file_size < 0)
+    {
+        req.out += fmt::format("Error. Can't read {}\n", req.args[0]);
+        return;
+    }
+
+    auto limit = static_cast<int>(std::min<int64_t>(file_size, (len > 0) ? len : MAX_LENGTH + 1));
+    std::vector<uint8_t> data(limit);
+    file.read(reinterpret_cast<char*>(data.data()), limit);
+    data.resize(static_cast<size_t>(file.gcount()));
 
     if (!zone_range_ok(addr, static_cast<int>(data.size()), req.out))
         return;
@@ -839,12 +930,14 @@ void cmd_get_tstates(Request& req)
     req.out += fmt::format("{}\n", CPU::frame_cycles);
 }
 
+constexpr int MAX_DISASSEMBLE_LINES = 0x10000;
+
 void cmd_disassemble(Request& req)
 {
     int addr = cpu.get_pc(), lines = 1;
-    if (!req.args.empty() && !get_number(req, 0, addr))
+    if (!req.args.empty() && !get_number_range(req, 0, addr, 0, 0xffff))
         return;
-    if (req.args.size() > 1 && !get_number(req, 1, lines))
+    if (req.args.size() > 1 && !get_number_range(req, 1, lines, 0, MAX_DISASSEMBLE_LINES))
         return;
 
     for (int i = 0; i < lines; ++i)
@@ -883,6 +976,8 @@ void cmd_send_keys_event(Request& req)
     set_key(held_keys, key, pressed);
 }
 
+constexpr int MAX_KEY_MS = 3600000;   // longest key hold for the typing commands
+
 void start_typing(Request& req, int ms, const std::vector<int>& chars)
 {
     if (!can_defer(req))
@@ -901,26 +996,34 @@ void start_typing(Request& req, int ms, const std::vector<int>& chars)
 
 void cmd_send_keys_string(Request& req)
 {
+    // Only the delay is a separate argument: the text may be nothing but spaces
     int ms = 0;
-    if (!need_args(req, 2) || !get_number(req, 0, ms))
+    if (!need_args(req, 1) || !get_number_range(req, 0, ms, 0, MAX_KEY_MS))
         return;
 
-    // The text is the rest of the line after the delay, spaces included
-    auto text = req.raw_rest.substr(req.raw_rest.find(req.args[0]) + req.args[0].size() + 1);
+    // The text is the rest of the line after the delay and one separator, spaces included
+    auto text_start = req.raw_rest.find(req.args[0]) + req.args[0].size() + 1;
+    if (text_start >= req.raw_rest.size())
+    {
+        req.out += "Error. Missing parameters\n";
+        return;
+    }
+
+    auto text = req.raw_rest.substr(text_start);
     start_typing(req, ms, std::vector<int>(text.begin(), text.end()));
 }
 
 void cmd_send_keys_ascii(Request& req)
 {
     int ms = 0;
-    if (!need_args(req, 2) || !get_number(req, 0, ms))
+    if (!need_args(req, 2) || !get_number_range(req, 0, ms, 0, MAX_KEY_MS))
         return;
 
     std::vector<int> chars;
     for (size_t i = 1; i < req.args.size(); ++i)
     {
         int code;
-        if (!get_number(req, i, code))
+        if (!get_number_range(req, i, code, 0, 255))
             return;
         chars.push_back(code);
     }
@@ -1132,7 +1235,7 @@ void cmd_set_membreakpoint(Request& req)
     if (req.args.size() > 2 && !get_number(req, 2, len))
         return;
 
-    if (type < MEMBP_NONE || type > MEMBP_READWRITE || len < 1 || addr < 0 || addr > 0xffff)
+    if (type < MEMBP_NONE || type > MEMBP_READWRITE || len < 1 || len > 0x10000 || addr < 0 || addr > 0xffff)
     {
         req.out += "Error. Usage: set-membreakpoint address type(0-3) [length]\n";
         return;
@@ -1279,16 +1382,16 @@ const std::vector<Command> commands
     { "enter-cpu-step", "pause", "", "Stops the emulation (cpu-step mode)", cmd_enter_step },
     { "exit-cpu-step", "resume", "", "Resumes the emulation", cmd_exit_step },
     { "cpu-step", "cs", "", "Runs one instruction, then shows the registers", cmd_cpu_step },
-    { "run", nullptr, "[instructions]", "Runs until a breakpoint fires (or after the given number of instructions), then stops", cmd_run },
+    { "run", nullptr, "[instructions]", "Runs until a breakpoint fires (or after the given number of instructions, 0 = no limit), then stops", cmd_run },
     { "run-frames", "rf", "[frames]", "Runs the given number of frames (default 1), then stops", cmd_run_frames },
     { "reset-cpu", nullptr, "", "Resets the SAM", cmd_reset },
     { "hard-reset-cpu", nullptr, "", "Clears RAM and resets the SAM", cmd_hard_reset },
     { "generate-nmi", nullptr, "", "Generates an NMI", cmd_nmi },
     { "set-speed", nullptr, "[normal|turbo|percent]", "Sets or shows the emulation speed (turbo = unthrottled)", cmd_set_speed },
     { "get-tstates", nullptr, "", "Shows the T-state count within the current frame", cmd_get_tstates },
-    { "disassemble", "d", "[address] [lines]", "Disassembles from the CPU's view of memory (default PC)", cmd_disassemble },
+    { "disassemble", "d", "[address] [lines]", "Disassembles from the CPU's view of memory (default PC); address 0-FFFFH, up to 65536 lines", cmd_disassemble },
 
-    { "read-memory", nullptr, "address [length]", "Reads memory as hex, from the current memory zone", cmd_read_memory },
+    { "read-memory", nullptr, "address [length]", "Reads memory as hex, from the current memory zone (the block must lie inside the zone; at most 16M)", cmd_read_memory },
     { "write-memory", nullptr, "address value [value ...]", "Writes bytes to the current memory zone", cmd_write_memory },
     { "write-memory-raw", nullptr, "address hexbytes", "Writes a hex string to the current memory zone", cmd_write_memory_raw },
     { "load-binary", nullptr, "file address [length]", "Loads a file into the current memory zone (length 0 = whole file)", cmd_load_binary },
@@ -1298,8 +1401,8 @@ const std::vector<Command> commands
     { "get-paging-state", nullptr, "", "Shows the paging ports and the page in each 16K section", cmd_get_paging_state },
 
     { "send-keys-event", nullptr, "key 1|0", "Presses (1) or releases (0) a key: a SAM key name (shift, symbol, cntrl, return, up, f1, ...) or a decimal ASCII code", cmd_send_keys_event },
-    { "send-keys-string", nullptr, "ms text", "Types text, holding each key for ms milliseconds (rounded to 20ms frames)", cmd_send_keys_string },
-    { "send-keys-ascii", nullptr, "ms code [code ...]", "Types decimal ASCII codes (13 = Return)", cmd_send_keys_ascii },
+    { "send-keys-string", nullptr, "ms text", "Types text (spaces included, even if it is only spaces), holding each key for ms milliseconds (0-3600000, rounded to 20ms frames)", cmd_send_keys_string },
+    { "send-keys-ascii", nullptr, "ms code [code ...]", "Types decimal ASCII codes 0-255 (13 = Return)", cmd_send_keys_ascii },
     { "release-keys", nullptr, "", "Releases all keys pressed with send-keys-event", cmd_release_keys },
 
     { "save-screen", nullptr, "file.png", "Saves the current frame as a PNG (works headless)", cmd_save_screen },

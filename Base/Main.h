@@ -22,6 +22,11 @@
 
 namespace Main
 {
+// Process exit status: 0 = normal, 1 = start-up failed, 2 = the remote control could not listen
+constexpr int EXIT_STARTUP_FAILED = 1;
+constexpr int EXIT_REMOTE_LISTEN_FAILED = 2;
+
 bool Init(int argc_, char* argv_[]);
+extern int exit_status;
 void Exit();
 }

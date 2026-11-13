@@ -827,6 +827,27 @@ Numbers in command arguments are decimal unless written with an `H` suffix or a
 actions use the debugger's expression syntax (see "Numeric expressions"), where
 bare numbers are hex.
 
+A number must fit in a 32-bit signed integer; anything larger, or not a number
+at all, is an error (`Error. Invalid number: ...`), as is a value outside the
+range a command accepts (`Error. Value out of range ...`). Memory blocks
+(`read-memory`, `write-memory*`, `load-binary`, `save-binary`) must lie inside
+the current memory zone (64K for zone -1, which doesn't wrap at 0xFFFF) and be
+no longer than 16M bytes, else `Error. Address or length out of range for this
+memory zone`. A bad argument never changes any state or stops the emulator.
+`set-register` takes 0-FFFFH for 16-bit registers, 0-255 for 8-bit registers and the
+ports, 0-2 for IM and 0-1 for IFF1/IFF2, and applies nothing if any assignment on
+the line is bad. `write-memory` values are -128 to 255, key codes 0-255, and `disassemble` takes
+an address from 0 to FFFFH and up to 65536 lines. `run` and `run-frames` take
+0 or more (`run-frames 0` just stops the emulation).
+
+`send-keys-string ms text` types everything after the delay and one separating
+space, so the text may be just spaces; with no text at all it is an error.
+
+Exit status: SimCoupe returns 0 on a normal exit, 1 if it could not start, and
+2 if remote control could not listen on its port (for example because another
+copy already uses it). Scripts can use this to tell a port clash from other
+failures.
+
 Commands that need emulated time (`run-frames`, `cpu-step`, `run`,
 `send-keys-string`, `send-keys-ascii`) reply when they finish; further input
 waits until then. They keep running if the client disconnects.

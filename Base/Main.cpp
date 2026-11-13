@@ -39,21 +39,35 @@ extern "C" int main(int argc_, char* argv_[])
 
     Main::Exit();
 
-    return 0;
+    return Main::exit_status;
 }
 
 namespace Main
 {
 
+int exit_status = 0;
+
 bool Init(int argc_, char* argv_[])
 {
+    exit_status = EXIT_STARTUP_FAILED;
+
     if (libspectrum_init() != LIBSPECTRUM_ERROR_NONE)
         return false;
 
     if (!Options::Load(argc_, argv_))
         return false;
 
-    return OSD::Init() && Frame::Init() && CPU::Init(true) && UI::Init() && Sound::Init() && Input::Init() && Video::Init() && Remote::Init();
+    if (!(OSD::Init() && Frame::Init() && CPU::Init(true) && UI::Init() && Sound::Init() && Input::Init() && Video::Init()))
+        return false;
+
+    if (!Remote::Init())
+    {
+        exit_status = EXIT_REMOTE_LISTEN_FAILED;
+        return false;
+    }
+
+    exit_status = 0;
+    return true;
 }
 
 void Exit()
