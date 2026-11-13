@@ -22,6 +22,8 @@
 //  Commands run on the emulation thread between chunks, so no locking is
 //  needed. Commands that need emulated time (run-frames, cpu-step, run,
 //  send-keys-*) hold back the reply and further input until they finish.
+//  New input stops a waiting run or run-frames, as in ZEsarUX: the socket is
+//  read between chunks (once a frame), so this costs nothing per instruction.
 
 #include "SimCoupe.h"
 #include "Remote.h"
@@ -97,7 +99,9 @@ struct Pending
 {
     Wait type = Wait::None;
     int count = 0;          // frames or instructions left (0 = no limit for Break)
+    int total = 0;          // the count asked for
     int owner = 0;          // client connection that should get the reply
+    size_t queued = 0;      // input already received when it started, which doesn't interrupt it
 };
 Pending pending;
 
@@ -513,8 +517,9 @@ bool can_defer(Request& req)
 void defer(Request& req, Wait type, int count)
 {
     pending.type = type;
-    pending.count = count;
+    pending.count = pending.total = count;
     pending.owner = client_id;
+    pending.queued = in_buf.size();
     req.deferred = true;
     update_trace();
 }
@@ -1382,8 +1387,8 @@ const std::vector<Command> commands
     { "enter-cpu-step", "pause", "", "Stops the emulation (cpu-step mode)", cmd_enter_step },
     { "exit-cpu-step", "resume", "", "Resumes the emulation", cmd_exit_step },
     { "cpu-step", "cs", "", "Runs one instruction, then shows the registers", cmd_cpu_step },
-    { "run", nullptr, "[instructions]", "Runs until a breakpoint fires (or after the given number of instructions, 0 = no limit), then stops", cmd_run },
-    { "run-frames", "rf", "[frames]", "Runs the given number of frames (default 1), then stops", cmd_run_frames },
+    { "run", nullptr, "[instructions]", "Runs until a breakpoint fires, the client sends anything (or a new client does), or after the given number of instructions (0 = no limit); then stops", cmd_run },
+    { "run-frames", "rf", "[frames]", "Runs the given number of frames (default 1), then stops; a breakpoint or any input from a client stops it early", cmd_run_frames },
     { "reset-cpu", nullptr, "", "Resets the SAM", cmd_reset },
     { "hard-reset-cpu", nullptr, "", "Clears RAM and resets the SAM", cmd_hard_reset },
     { "generate-nmi", nullptr, "", "Generates an NMI", cmd_nmi },
@@ -1510,6 +1515,7 @@ void close_client()
 
     client_socket = INVALID_SOCKET;
     in_buf.clear();
+    pending.queued = 0;
     out_buf.clear();
     close_after_flush = false;
 }
@@ -1566,8 +1572,27 @@ void read_client()
         close_client();
 }
 
+// Input that arrives while run or run-frames is waiting stops the emulation, as ZEsarUX does,
+// with a reply like a breakpoint stop; the input is then handled as usual. Commands sent
+// together with the run (already queued) don't count. A disconnect doesn't stop the run, but
+// the next client's input does (the reply then only goes to the log, as that client didn't
+// send the run).
+void check_interrupt()
+{
+    if ((pending.type != Wait::Frames && pending.type != Wait::Break) || in_buf.size() <= pending.queued)
+        return;
+
+    auto message = fmt::format("Interrupted by client input at PC={:04X}H", cpu.get_pc());
+    if (pending.type == Wait::Frames)
+        message += fmt::format(" after {} of {} frames", pending.total - pending.count, pending.total);
+
+    stop_with(message);
+}
+
 void process_input()
 {
+    check_interrupt();
+
     while (pending.type == Wait::None && client_socket != INVALID_SOCKET && !close_after_flush)
     {
         auto eol = in_buf.find('\n');

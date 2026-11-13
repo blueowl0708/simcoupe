@@ -852,11 +852,24 @@ Commands that need emulated time (`run-frames`, `cpu-step`, `run`,
 `send-keys-string`, `send-keys-ascii`) reply when they finish; further input
 waits until then. They keep running if the client disconnects.
 
+`run` and `run-frames` can be interrupted, as `run` can in ZEsarUX: anything the
+client sends while they are running (even a bare Return) stops the emulation
+within a frame, at normal or turbo speed. The reply is
+`Interrupted by client input at PC=xxxxH` (for `run-frames`, followed by
+`after N of M frames`), like a breakpoint stop, and the emulation is left in
+cpu-step mode. The input is then handled as usual, so `pause` or
+`get-registers` both stop a run and answer. Unlike ZEsarUX, the input is not
+thrown away. Commands sent together with the `run` (already received when it
+started) don't interrupt it: they wait for it as before. A new connection's first input
+stops a run left by a previous client too; that client gets no reply for it, as
+it didn't send the run, but the stop is in the breakpoint log. A disconnect
+alone doesn't stop a run.
+
 | Group | Commands |
 |---|---|
 | Session | `help`, `get-version`, `noop`, `quit`, `exit-emulator` |
 | CPU | `get-registers` (ZRCP format plus LMPR/HMPR/VMPR), `set-register reg=value ...` (also LMPR, HMPR, VMPR, BORDER), `enter-cpu-step`/`pause`, `exit-cpu-step`/`resume`, `cpu-step`, `run [instructions]`, `reset-cpu`, `hard-reset-cpu` (also clears RAM), `generate-nmi`, `get-tstates`, `disassemble [addr] [lines]` |
-| Speed | `run-frames [N]` (run N frames, then stop), `set-speed normal\|turbo\|percent` |
+| Speed | `run-frames [N]` (run N frames, then stop; interruptible), `set-speed normal\|turbo\|percent` |
 | Memory | `read-memory addr [len]`, `write-memory addr byte ...`, `write-memory-raw addr hex`, `load-binary file addr [len]`, `save-binary file addr len`, `get-memory-zones`, `set-memory-zone n` |
 | Paging | `get-paging-state` (ports, mode, ROM/write-protect state and the page in each section) |
 | Keys | `send-keys-event key 1\|0`, `send-keys-string ms text`, `send-keys-ascii ms code ...`, `release-keys` |
