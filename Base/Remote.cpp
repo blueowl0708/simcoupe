@@ -169,6 +169,27 @@ std::deque<IoEntry> io_log;
 uint64_t io_dropped;
 uint64_t frame_count;                   // frames run since start-up
 
+// Execution history: a ring of the state before each instruction, filled by OnInstruction while
+// enabled. A repeat of the same instruction (LDIR, HALT, JR $) replaces the entry and counts.
+constexpr size_t HISTORY_SLOTS = 10000;
+constexpr int DEFAULT_HISTORY_LINES = 20;
+struct HistoryEntry
+{
+    uint16_t pc, sp, af, bc, de, hl, ix, iy, af2, bc2, de2, hl2;
+    uint8_t i, r, im, iffs;     // iffs: bit 0 = IFF1, bit 1 = IFF2
+    uint8_t lmpr, hmpr, vmpr;
+    int page;                   // physical page the instruction was fetched from
+    std::array<uint8_t, 4> bytes;
+    uint32_t repeats;
+};
+bool history_enabled;
+std::vector<HistoryEntry> history;      // ring of HISTORY_SLOTS once first used
+size_t history_next;                    // slot the next entry goes in
+size_t history_count;
+uint64_t history_dropped;
+HistoryEntry history_pending;           // the instruction about to run, not yet in the ring
+bool history_armed;                     // history_pending is valid
+
 std::deque<std::string> log_lines;
 
 bool coverage_enabled;
@@ -474,7 +495,7 @@ void update_trace()
     bool any_breakpoints = breakpoints_enabled &&
         std::any_of(breakpoints.begin(), breakpoints.end(), [](auto& bp) { return bp.enabled; });
 
-    trace_instructions = coverage_enabled || any_breakpoints ||
+    trace_instructions = coverage_enabled || history_enabled || any_breakpoints ||
         (breakpoints_enabled && !mem_breakpoints.empty()) ||
         pending.type == Wait::Instructions || (pending.type == Wait::Break && pending.count);
 
@@ -719,6 +740,72 @@ bool can_defer(Request& req)
     return !held_by_window(req);
 }
 
+// The state before the instruction about to run (the CPU's current PC and registers)
+void history_capture(HistoryEntry& e)
+{
+    auto pc = cpu.get_pc();
+    e.pc = pc;
+    e.sp = cpu.get_sp();
+    e.af = cpu.get_af();
+    e.bc = cpu.get_bc();
+    e.de = cpu.get_de();
+    e.hl = cpu.get_hl();
+    e.ix = cpu.get_ix();
+    e.iy = cpu.get_iy();
+    e.af2 = cpu.get_alt_af();
+    e.bc2 = cpu.get_alt_bc();
+    e.de2 = cpu.get_alt_de();
+    e.hl2 = cpu.get_alt_hl();
+    e.i = cpu.get_i();
+    e.r = cpu.get_r();
+    e.im = static_cast<uint8_t>(cpu.get_int_mode());
+    e.iffs = (cpu.get_iff1() ? 1 : 0) | (cpu.get_iff2() ? 2 : 0);
+    e.lmpr = IO::State().lmpr;
+    e.hmpr = IO::State().hmpr;
+    e.vmpr = IO::State().vmpr;
+    e.page = PtrPage(AddrReadPtr(pc));
+    for (int j = 0; j < 4; ++j)
+        e.bytes[j] = read_byte(static_cast<uint16_t>(pc + j));
+    e.repeats = 1;
+}
+
+// Called when execution resumes (and when recording starts): captures the instruction that is
+// about to run. It is only added to the history when the next hook shows it has run.
+void history_arm()
+{
+    history_armed = history_enabled;
+    if (history_armed)
+        history_capture(history_pending);
+}
+
+// Called after each instruction has run: adds it (as captured before it ran, a repeat of the
+// previous entry's address being counted instead), then captures the next one
+void history_record()
+{
+    if (history_armed)
+    {
+        auto& last = history[(history_next + HISTORY_SLOTS - 1) % HISTORY_SLOTS];
+        if (history_count && last.pc == history_pending.pc && last.page == history_pending.page)
+        {
+            auto repeats = last.repeats + 1;
+            last = history_pending;
+            last.repeats = repeats;
+        }
+        else
+        {
+            history[history_next] = history_pending;
+            history_next = (history_next + 1) % HISTORY_SLOTS;
+            if (history_count < HISTORY_SLOTS)
+                ++history_count;
+            else
+                ++history_dropped;
+        }
+    }
+
+    history_armed = true;
+    history_capture(history_pending);
+}
+
 void defer(Request& req, Wait type, int count)
 {
     pending.type = type;
@@ -727,6 +814,7 @@ void defer(Request& req, Wait type, int count)
     pending.queued = in_buf.size();
     req.deferred = true;
     last_instr_pc = cpu.get_pc();
+    history_arm();
     update_trace();
 }
 
@@ -882,6 +970,7 @@ void cmd_exit_step(Request&)
 {
     stopped = false;
     last_instr_pc = cpu.get_pc();
+    history_arm();
 }
 
 void cmd_cpu_step(Request& req)
@@ -1151,6 +1240,28 @@ void cmd_get_tstates(Request& req)
     req.out += fmt::format("{}\n", CPU::frame_cycles);
 }
 
+// Disassembles one instruction. With symbols loaded, jump targets and operands are named (names
+// come with colour codes: \a and a letter, which are removed)
+unsigned disassemble_text(uint8_t* bytes, uint16_t pc, char* text, size_t size)
+{
+    bool symbols = Symbol::HasRemote();
+    auto len = Disassemble(bytes, pc, text, size, symbols ? DISASSEMBLE_LABEL_LEN : 0);
+    if (symbols)
+    {
+        std::string plain;
+        for (auto* p = text; *p; ++p)
+        {
+            if (*p == '\a' && p[1])
+                ++p;
+            else
+                plain += *p;
+        }
+        std::strncpy(text, plain.c_str(), size - 1);
+        text[size - 1] = '\0';
+    }
+    return len;
+}
+
 constexpr int MAX_DISASSEMBLE_LINES = 0x10000;
 
 void cmd_disassemble(Request& req)
@@ -1168,23 +1279,10 @@ void cmd_disassemble(Request& req)
         for (int j = 0; j < 4; ++j)
             bytes[j] = read_byte(static_cast<uint16_t>(pc + j));
 
-        // With symbols loaded, jump targets and operands are named, and an instruction at a
-        // label follows a "label:" line (names come with colour codes: \a and a letter)
-        bool symbols = Symbol::HasRemote();
         char text[256]{};
-        auto len = Disassemble(bytes.data(), pc, text, sizeof(text), symbols ? DISASSEMBLE_LABEL_LEN : 0);
-        if (symbols)
+        auto len = disassemble_text(bytes.data(), pc, text, sizeof(text));
+        if (Symbol::HasRemote())
         {
-            std::string plain;
-            for (auto* p = text; *p; ++p)
-            {
-                if (*p == '\a' && p[1])
-                    ++p;
-                else
-                    plain += *p;
-            }
-            std::strncpy(text, plain.c_str(), sizeof(text) - 1);
-
             if (auto label = Symbol::NameRemote(pc, 0); !label.empty())
                 req.out += label + ":\n";
         }
@@ -1927,6 +2025,73 @@ void cmd_io_log(Request& req)
     }
 }
 
+void cmd_cpu_history(Request& req)
+{
+    if (!need_args(req, 1))
+        return;
+
+    auto action = to_lower(req.args[0]);
+    if (action == "enabled")
+    {
+        bool yes;
+        if (!need_args(req, 2))
+            return;
+        if (!is_yes(req.args[1], yes))
+        {
+            req.out += "Error. Use enabled yes|no\n";
+            return;
+        }
+
+        if (yes && history.empty())
+            history.resize(HISTORY_SLOTS);
+
+        history_enabled = yes;
+        history_arm();
+        update_trace();
+    }
+    else if (action == "clear")
+    {
+        history_next = history_count = 0;
+        history_dropped = 0;
+    }
+    else
+    {
+        req.out += "Error. Use enabled yes|no or clear\n";
+    }
+}
+
+void cmd_get_cpu_history(Request& req)
+{
+    int lines = DEFAULT_HISTORY_LINES;
+    if (!req.args.empty() && !get_number_range(req, 0, lines, 1, static_cast<int>(HISTORY_SLOTS)))
+        return;
+
+    auto count = std::min(history_count, static_cast<size_t>(lines));
+    req.out += fmt::format("CPU history {}: {} entries, {} dropped, showing {}\n", history_enabled ? "on" : "off",
+        history_count, history_dropped, count);
+
+    for (size_t n = history_count - count; n < history_count; ++n)
+    {
+        auto& e = history[(history_next + HISTORY_SLOTS - history_count + n) % HISTORY_SLOTS];
+
+        char text[256]{};
+        auto len = disassemble_text(e.bytes.data(), e.pc, text, sizeof(text));
+        std::string hex;
+        for (unsigned j = 0; j < len; ++j)
+            hex += fmt::format("{:02X}", e.bytes[j]);
+
+        auto label = sym_name(e.pc);
+        req.out += fmt::format(
+            "{:04X}H {}:{:04X} {:<8} {:<22} AF={:04X} BC={:04X} DE={:04X} HL={:04X} SP={:04X} IX={:04X} IY={:04X} "
+            "AF'={:04X} BC'={:04X} DE'={:04X} HL'={:04X} I={:02X} R={:02X} IM{} IFF{}{} LMPR={:02X} HMPR={:02X} VMPR={:02X}{}{}\n",
+            e.pc, Memory::PageDesc(e.page, true), e.pc & (MEM_PAGE_SIZE - 1), hex, text, e.af, e.bc, e.de, e.hl, e.sp, e.ix, e.iy,
+            e.af2, e.bc2, e.de2, e.hl2, e.i, e.r, e.im, (e.iffs & 1) ? '1' : '-', (e.iffs & 2) ? '2' : '-',
+            e.lmpr, e.hmpr, e.vmpr,
+            e.repeats > 1 ? fmt::format(" x{}", e.repeats) : "",
+            label.empty() ? "" : " sym=" + label);
+    }
+}
+
 const std::vector<Command> commands
 {
     { "help", "?", "[command]", "Lists commands, or shows help for one", cmd_help },
@@ -1980,6 +2145,8 @@ const std::vector<Command> commands
     { "clear-membreakpoints", nullptr, "", "Clears all memory breakpoints", cmd_clear_membreakpoints },
     { "set-portbreakpoint", nullptr, "port type [mask]", "Stops on port I/O: type 0 = clear, 1 = in, 2 = out, 3 = both; port is a number or a name (lmpr, hmpr, vmpr, border ...); a port matches when (port & mask) equals the given one (default mask FFH, or FFFFH for a port above FFH). Checked after enable-breakpoints", cmd_set_portbreakpoint },
     { "clear-portbreakpoints", nullptr, "", "Clears all port breakpoints", cmd_clear_portbreakpoints },
+    { "cpu-history", nullptr, "enabled yes|no | clear", "Records the CPU state before each instruction in a ring of 10000 (off by default; it slows emulation while on); clear empties it. Read with get-cpu-history", cmd_cpu_history },
+    { "get-cpu-history", nullptr, "[count]", "Shows the newest count (default 20, at most 10000) instructions that have run since recording was on, oldest first: address, physical page and offset, bytes, disassembly and the registers before it ran; each instruction that executes is recorded once, an instruction stopped before is not until it runs; a repeat at the same address (LDIR, JR $) is one line marked xN with the registers before its last run", cmd_get_cpu_history },
     { "io-log", nullptr, "enabled yes|no | filter [in|out] [port[:mask] ...] | get [count] | clear", "Logs I/O without stopping (frame, cycle, instruction address, direction, port, value); filter limits it to the ports and direction given (none = all); get shows the newest entries and the number dropped (at most 100000 are kept)", cmd_io_log },
     { "get-breakpoint-log", nullptr, "", "Shows the log written by breakpoint actions and stops", cmd_get_breakpoint_log },
     { "clear-breakpoint-log", nullptr, "", "Clears the breakpoint log", cmd_clear_breakpoint_log },
@@ -2320,6 +2487,9 @@ void Poll()
 
 bool OnInstruction()
 {
+    if (history_enabled)
+        history_record();
+
     if (coverage_enabled)
     {
         auto offset = AddrReadPtr(cpu.get_pc()) - pMemory;

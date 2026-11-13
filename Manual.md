@@ -894,6 +894,7 @@ continue.
 | Disks | `insert-disk 1\|2 file [boot]`, `eject-disk [1\|2]` |
 | Breakpoints | `enable-breakpoints`, `disable-breakpoints`, `set-breakpoint`/`sb idx [cond]`, `set-breakpointaction`/`sba idx [action]`, `enable-breakpoint`/`eb idx`, `disable-breakpoint`/`db idx`, `get-breakpoints`, `set-membreakpoint addr|page:offset type [len]`, `clear-membreakpoints`, `set-portbreakpoint port type [mask]`, `clear-portbreakpoints`, `get-breakpoint-log`, `clear-breakpoint-log` |
 | I/O log | `io-log enabled yes\|no`, `io-log filter [in\|out] [port[:mask] ...]`, `io-log get [count]`, `io-log clear` |
+| History | `cpu-history enabled yes\|no`, `cpu-history clear`, `get-cpu-history [count]` |
 | Coverage | `cpu-code-coverage enabled yes\|no`, `clear`, `get [symbols]`, `get-physical` |
 | Symbols | `load-symbols file [append]`, `clear-symbols`, `get-symbols [prefix]` |
 
@@ -961,6 +962,32 @@ EBBDH` and the emulation stops after that instruction finishes, so PC is
 already past it; the address in the message is the IN or OUT itself (for a
 repeating `INIR`/`OTIR` it is the instruction, once per transfer). The message
 is also added to the breakpoint log. A breakpoint action can't be set.
+
+`cpu-history` keeps the CPU's recent past, to see how it got to a breakpoint
+stop. It is off by default, and nothing is recorded or costs anything until
+`cpu-history enabled yes`; `enabled no` stops recording but keeps what was
+recorded, and `cpu-history clear` empties it (and the dropped count). While it
+is on, the state before every instruction that runs is added to a ring of 10000,
+so it holds only what ran after it was turned on, and it survives `run`,
+`run-frames` and stops. Every instruction that executes is recorded exactly
+once, in order, including the first one after `run`, `run-frames`, `cpu-step` or
+`exit-cpu-step` (also after `set-register pc=`). The instruction a breakpoint
+stopped before has not run, so it is not in the history until you resume and it
+runs. `get-cpu-history [count]` shows the newest `count`
+(default 20, 1 to 10000), oldest first, under a header such as `CPU history on:
+8 entries, 0 dropped, showing 8` (the dropped count is entries pushed out of the
+full ring). Each line is `8003H RAM00:0003 3C       INC  A   AF=0000 BC=0300 ...`:
+the CPU address of the instruction, the physical page and offset it was fetched
+from, its bytes, its disassembly, and the registers (AF, BC, DE, HL, SP, IX, IY,
+the alternate AF, BC, DE, HL, I, R, interrupt mode and flip-flops, and LMPR,
+HMPR, VMPR) as they were before it ran, so after a breakpoint stop the last
+line is the instruction before the one at PC. An instruction
+repeated at the same address (a repeating `LDIR`, a `JR $` loop) is a single
+line ending ` x8`, showing the registers before its last repeat. With symbols
+loaded a line ends with `sym=label`, and the disassembly names jump targets as
+for `disassemble`. An interrupt appears as the entry at its handler's address
+(0038H in ROM0). While recording is on emulation is slightly slower, with no
+difference measured at turbo speed in a 3000-frame run.
 
 `io-log` records I/O without stopping: `io-log enabled yes|no` turns it on or
 off, `io-log filter [in|out] [port[:mask] ...]` limits it to the given ports
