@@ -894,7 +894,8 @@ continue.
 | Disks | `insert-disk 1\|2 file [boot]`, `eject-disk [1\|2]` |
 | Breakpoints | `enable-breakpoints`, `disable-breakpoints`, `set-breakpoint`/`sb idx [cond]`, `set-breakpointaction`/`sba idx [action]`, `enable-breakpoint`/`eb idx`, `disable-breakpoint`/`db idx`, `get-breakpoints`, `set-membreakpoint addr|page:offset type [len]`, `clear-membreakpoints`, `set-portbreakpoint port type [mask]`, `clear-portbreakpoints`, `get-breakpoint-log`, `clear-breakpoint-log` |
 | I/O log | `io-log enabled yes\|no`, `io-log filter [in\|out] [port[:mask] ...]`, `io-log get [count]`, `io-log clear` |
-| Coverage | `cpu-code-coverage enabled yes\|no`, `clear`, `get`, `get-physical` |
+| Coverage | `cpu-code-coverage enabled yes\|no`, `clear`, `get [symbols]`, `get-physical` |
+| Symbols | `load-symbols file [append]`, `clear-symbols`, `get-symbols [prefix]` |
 
 Memory zones: zone -1 (the default) is the CPU's current view of memory. Other
 zones are SimCoupe page numbers (0-31 internal RAM, 32 upwards external RAM,
@@ -981,6 +982,50 @@ by the remote itself (`set-register lmpr=...`) or by the debugger is not
 logged. With the log off and no port breakpoints set, I/O costs nothing extra.
 Unlike ZEsarUX, which has no port breakpoint command, the names and the mask
 are SAM-specific.
+
+Symbols. `load-symbols file [append]` loads labels from an assembler's symbol
+file: a pyz80 `--exportfile` (a Python pickle, as the Rebelstar II SAM build
+writes), an sjasmplus `--sym=` file (`name: EQU 0x8000`), the label table at
+the end of an sjasmplus `--lstlab` listing, or a plain `hexaddress=name` file;
+the format is found from the contents. The file is read in full first: a bad
+line gives `Error. Symbols not loaded, line 7: ...` and changes nothing (the
+labels already loaded stay). It replaces the loaded labels, or adds to them
+with `append` (a name loaded again, ignoring case, takes the new value). Values
+above FFFFH (large constants) can't be addresses and are skipped, and counted in
+the reply; small constants (`equ 7`) are loaded like any label, so they may
+label low addresses. `get-symbols [prefix]` lists them (`8000 start`, sorted by
+address, after a `Symbols: 3 of 12` line; the prefix ignores case) and
+`clear-symbols` removes them. Labels are 16-bit values in the CPU's view, with no
+page: sjasmplus gives the address in the section the code runs in, and pyz80
+likewise. A label is accepted by name, in any letter case, anywhere an address
+is (`read-memory`, `write-memory`, `write-memory-raw`, `load-binary`,
+`save-binary`, `disassemble`, `set-membreakpoint`, and as a value in
+`set-register`), also as `name+N` or `name-N`, and in breakpoint conditions,
+`printe` and `putv` (`sb 1 PC=main_loop`); the name is looked up when the
+command runs, so changing the symbols later doesn't alter a breakpoint already
+set. A name that isn't loaded is an error (`Error. Unknown label: nosuch`), never
+address 0; the one exception is inside a breakpoint condition, where a name made
+only of hex digits (`beef`) that isn't a label is the number, as in the debugger.
+With labels loaded they are shown, as `label` or `label+0x1A` (up to 7FH past the
+nearest label before it): `disassemble` names jump and call targets (up to 3
+past a label, as the debugger does) and puts a `label:` line before an
+instruction at a label; `get-registers` and the other register replies end with
+`SYMBOLS: PC:label+0x4 HL:other` (PC always, the others only when exactly at a
+label); breakpoint, port, memory and interrupt stops add ` (label)` after the
+instruction address; `io-log get` lines end with `sym=label` for the
+instruction's address; and `cpu-code-coverage get symbols` writes
+`8003(loop+0x2)` for each address (`get-physical` has no CPU address, so shows
+none). With no labels loaded all output is as before and nothing is looked up.
+Paging: a label is matched on its 16-bit address alone, whatever page is mapped
+there when the output is made. Where several labels share an address one is shown
+(the first by name); and the same address in two different pages (for example
+the SAM drivers in page 0 and game code at 8000H, or ROM and RAM) can't be told
+apart, so a label can name an address in a page it doesn't belong to, and one
+set of labels should be loaded for the memory layout being debugged (load another
+file to switch, or `append` two that don't overlap). While labels were loaded by
+the remote, the window debugger's own symbol file loading leaves them alone.
+Unlike ZEsarUX, which has no symbol commands (it only searches loaded source
+code with `find-label`), these are SAM-specific additions.
 
 Example session:
 ```

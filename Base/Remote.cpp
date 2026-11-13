@@ -39,6 +39,7 @@
 #include "Options.h"
 #include "SAMIO.h"
 #include "SavePNG.h"
+#include "Symbol.h"
 
 #include <cerrno>
 #include <limits>
@@ -252,6 +253,24 @@ std::optional<int> parse_number(std::string s)
     return static_cast<int>(value);
 }
 
+// Labels from load-symbols are 16-bit CPU-view addresses, so they only describe addresses
+// seen through the CPU (the page paged in there is not considered). Nothing is added to
+// any output until symbols are loaded.
+constexpr int MAX_LABEL_OFFSET = 0x7f;      // label+offset is shown up to this far past a label
+constexpr int DISASSEMBLE_LABEL_LEN = 64;
+
+std::string sym_name(uint16_t addr)
+{
+    return Symbol::NameRemote(addr, MAX_LABEL_OFFSET);
+}
+
+// " (label+0x4)" for appending after an address in a message, or nothing
+std::string sym_suffix(uint16_t addr)
+{
+    auto name = sym_name(addr);
+    return name.empty() ? "" : " (" + name + ")";
+}
+
 std::string flags_string(uint8_t f)
 {
     static const char flag_names[] = "SZ5H3PNC";
@@ -259,6 +278,31 @@ std::string flags_string(uint8_t f)
     for (int i = 0; i < 8; ++i)
         s += (f & (0x80 >> i)) ? flag_names[i] : ' ';
     return s;
+}
+
+// With symbols loaded: PC as label+offset, and any other 16-bit register that is exactly
+// at a label
+std::string registers_symbols()
+{
+    if (!Symbol::HasRemote())
+        return "";
+
+    std::string s;
+    auto add = [&](const char* name, uint16_t value, int max_offset)
+    {
+        auto label = Symbol::NameRemote(value, max_offset);
+        if (!label.empty())
+            s += fmt::format(" {}:{}", name, label);
+    };
+
+    add("PC", cpu.get_pc(), MAX_LABEL_OFFSET);
+    add("SP", cpu.get_sp(), 0);
+    add("BC", cpu.get_bc(), 0);
+    add("DE", cpu.get_de(), 0);
+    add("HL", cpu.get_hl(), 0);
+    add("IX", cpu.get_ix(), 0);
+    add("IY", cpu.get_iy(), 0);
+    return s.empty() ? "" : "  SYMBOLS:" + s;
 }
 
 std::string registers_string()
@@ -272,7 +316,7 @@ std::string registers_string()
         cpu.get_ix(), cpu.get_iy(), cpu.get_alt_af(), cpu.get_alt_bc(), cpu.get_alt_hl(), cpu.get_alt_de(),
         cpu.get_i(), cpu.get_r(), flags_string(cpu.get_f()), flags_string(cpu.get_alt_af() & 0xff),
         cpu.get_wz(), cpu.get_int_mode(), cpu.get_iff1() ? '1' : '-', cpu.get_iff2() ? '2' : '-',
-        io.lmpr, io.hmpr, io.vmpr);
+        io.lmpr, io.hmpr, io.vmpr) + registers_symbols();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -542,6 +586,74 @@ bool get_number_range(Request& req, size_t index, int& value, int lo, int hi)
     return true;
 }
 
+// An address argument: a number, or a loaded label with an optional +N or -N. The label's value
+// is a 16-bit CPU-view address whatever zone is selected.
+std::optional<int> parse_address(const std::string& arg, std::string& error)
+{
+    if (auto label = Symbol::FindRemote(arg))
+        return label;
+
+    auto sign = arg.find_first_of("+-", 1);
+    if (sign != std::string::npos)
+    {
+        if (auto base = Symbol::FindRemote(arg.substr(0, sign)))
+        {
+            auto offset = parse_number(arg.substr(sign + 1));
+            if (!offset || *offset < 0)
+            {
+                error = fmt::format("Error. Invalid offset after the label: {}\n", arg);
+                return std::nullopt;
+            }
+
+            int64_t addr = *base + (arg[sign] == '+' ? int64_t(*offset) : -int64_t(*offset));
+            if (addr < 0 || addr > 0xffff)
+            {
+                error = fmt::format("Error. Label plus offset is outside 0 to FFFFH: {}\n", arg);
+                return std::nullopt;
+            }
+            return static_cast<int>(addr);
+        }
+    }
+
+    if (auto n = parse_number(arg))
+        return n;
+
+    auto first = arg.empty() ? '\0' : arg[0];
+    if (std::isalpha(static_cast<unsigned char>(first)) || first == '_' || first == '.')
+        error = fmt::format("Error. Unknown label: {}{}\n", arg, Symbol::HasRemote() ? "" : " (no symbols loaded)");
+    else
+        error = fmt::format("Error. Invalid number: {}\n", arg);
+    return std::nullopt;
+}
+
+// get_number for an address: also accepts labels
+bool get_address(Request& req, size_t index, int& value)
+{
+    std::string error;
+    auto n = parse_address(req.args[index], error);
+    if (!n)
+    {
+        req.out += error;
+        return false;
+    }
+    value = *n;
+    return true;
+}
+
+bool get_address_range(Request& req, size_t index, int& value, int lo, int hi)
+{
+    int n;
+    if (!get_address(req, index, n))
+        return false;
+    if (n < lo || n > hi)
+    {
+        req.out += fmt::format("Error. Value out of range ({} to {}): {}\n", lo, hi, req.args[index]);
+        return false;
+    }
+    value = n;
+    return true;
+}
+
 // Names accepted wherever a port number is (the low byte of the port: most SAM ports ignore
 // the high byte). Shared by set-register (the ones marked settable) and the port commands.
 struct PortName
@@ -711,10 +823,11 @@ void cmd_set_register(Request& req)
     {
         auto eq = arg.find('=');
         auto name = to_lower(arg.substr(0, eq));
-        auto value = (eq == std::string::npos) ? std::nullopt : parse_number(arg.substr(eq + 1));
+        std::string error;
+        auto value = (eq == std::string::npos) ? std::nullopt : parse_address(arg.substr(eq + 1), error);
         if (!value)
         {
-            req.out += fmt::format("Error. Expected register=value: {}\n", arg);
+            req.out += error.empty() ? fmt::format("Error. Expected register=value: {}\n", arg) : error;
             return;
         }
 
@@ -735,10 +848,11 @@ void cmd_set_register(Request& req)
     {
         auto eq = arg.find('=');
         auto name = to_lower(arg.substr(0, eq));
-        auto value = (eq == std::string::npos) ? std::nullopt : parse_number(arg.substr(eq + 1));
+        std::string error;
+        auto value = (eq == std::string::npos) ? std::nullopt : parse_address(arg.substr(eq + 1), error);
         if (!value)
         {
-            req.out += fmt::format("Error. Expected register=value: {}\n", arg);
+            req.out += error.empty() ? fmt::format("Error. Expected register=value: {}\n", arg) : error;
             return;
         }
 
@@ -859,7 +973,7 @@ void cmd_set_speed(Request& req)
 void cmd_read_memory(Request& req)
 {
     int addr = 0, len = 1;
-    if (!req.args.empty() && !get_number(req, 0, addr))
+    if (!req.args.empty() && !get_address(req, 0, addr))
         return;
     if (req.args.size() > 1 && !get_number(req, 1, len))
         return;
@@ -876,7 +990,7 @@ void cmd_read_memory(Request& req)
 void cmd_write_memory(Request& req)
 {
     int addr = 0;
-    if (!need_args(req, 2) || !get_number(req, 0, addr))
+    if (!need_args(req, 2) || !get_address(req, 0, addr))
         return;
 
     std::vector<uint8_t> data;
@@ -898,7 +1012,7 @@ void cmd_write_memory(Request& req)
 void cmd_write_memory_raw(Request& req)
 {
     int addr = 0;
-    if (!need_args(req, 2) || !get_number(req, 0, addr))
+    if (!need_args(req, 2) || !get_address(req, 0, addr))
         return;
 
     auto& hex = req.args[1];
@@ -919,7 +1033,7 @@ void cmd_write_memory_raw(Request& req)
 void cmd_load_binary(Request& req)
 {
     int addr = 0, len = 0;
-    if (!need_args(req, 2) || !get_number(req, 1, addr))
+    if (!need_args(req, 2) || !get_address(req, 1, addr))
         return;
     if (req.args.size() > 2 && !get_number(req, 2, len))
         return;
@@ -965,7 +1079,7 @@ void cmd_load_binary(Request& req)
 void cmd_save_binary(Request& req)
 {
     int addr = 0, len = 0;
-    if (!need_args(req, 3) || !get_number(req, 1, addr) || !get_number(req, 2, len))
+    if (!need_args(req, 3) || !get_address(req, 1, addr) || !get_number(req, 2, len))
         return;
     if (!zone_range_ok(addr, len, req.out))
         return;
@@ -1042,7 +1156,7 @@ constexpr int MAX_DISASSEMBLE_LINES = 0x10000;
 void cmd_disassemble(Request& req)
 {
     int addr = cpu.get_pc(), lines = 1;
-    if (!req.args.empty() && !get_number_range(req, 0, addr, 0, 0xffff))
+    if (!req.args.empty() && !get_address_range(req, 0, addr, 0, 0xffff))
         return;
     if (req.args.size() > 1 && !get_number_range(req, 1, lines, 0, MAX_DISASSEMBLE_LINES))
         return;
@@ -1054,8 +1168,26 @@ void cmd_disassemble(Request& req)
         for (int j = 0; j < 4; ++j)
             bytes[j] = read_byte(static_cast<uint16_t>(pc + j));
 
-        char text[64]{};
-        auto len = Disassemble(bytes.data(), pc, text, sizeof(text));
+        // With symbols loaded, jump targets and operands are named, and an instruction at a
+        // label follows a "label:" line (names come with colour codes: \a and a letter)
+        bool symbols = Symbol::HasRemote();
+        char text[256]{};
+        auto len = Disassemble(bytes.data(), pc, text, sizeof(text), symbols ? DISASSEMBLE_LABEL_LEN : 0);
+        if (symbols)
+        {
+            std::string plain;
+            for (auto* p = text; *p; ++p)
+            {
+                if (*p == '\a' && p[1])
+                    ++p;
+                else
+                    plain += *p;
+            }
+            std::strncpy(text, plain.c_str(), sizeof(text) - 1);
+
+            if (auto label = Symbol::NameRemote(pc, 0); !label.empty())
+                req.out += label + ":\n";
+        }
 
         std::string hex;
         for (unsigned j = 0; j < len; ++j)
@@ -1263,7 +1395,7 @@ void cmd_set_breakpoint(Request& req)
         auto expr = Expr::Compile(condition, remain);
         if (!expr || !trim(remain).empty())
         {
-            req.out += fmt::format("Error. Invalid condition: {}\n", condition);
+            req.out += fmt::format("Error. Invalid condition (a syntax error, or a label that is not loaded): {}\n", condition);
             return;
         }
 
@@ -1415,7 +1547,7 @@ void cmd_set_membreakpoint(Request& req)
         if (!parse_physical(req, req.args[0], page, addr))
             return;
     }
-    else if (!get_number(req, 0, addr))
+    else if (!get_address(req, 0, addr))
         return;
 
     if (req.args.size() > 2 && !get_number(req, 2, len))
@@ -1548,6 +1680,47 @@ void cmd_putv(Request& req)
     Log(std::to_string(value));
 }
 
+void cmd_load_symbols(Request& req)
+{
+    if (!need_args(req, 1))
+        return;
+
+    bool append = false;
+    if (req.args.size() > 1)
+    {
+        if (req.args.size() > 2 || to_lower(req.args[1]) != "append")
+        {
+            req.out += "Error. Usage: load-symbols file [append]\n";
+            return;
+        }
+        append = true;
+    }
+
+    std::string error;
+    size_t loaded, skipped;
+    if (!Symbol::LoadFile(req.args[0], append, error, loaded, skipped))
+    {
+        req.out += fmt::format("Error. Symbols not loaded, {}\n", error);
+        return;
+    }
+
+    req.out += fmt::format("Loaded {} symbols{}, {} in total\n", loaded,
+        skipped ? fmt::format(" ({} skipped: value outside 0-FFFFH)", skipped) : "", Symbol::RemoteCount());
+}
+
+void cmd_clear_symbols(Request&)
+{
+    Symbol::ClearRemote();
+}
+
+void cmd_get_symbols(Request& req)
+{
+    auto list = Symbol::ListRemote(req.args.empty() ? "" : req.args[0]);
+    req.out += fmt::format("Symbols: {} of {}\n", list.size(), Symbol::RemoteCount());
+    for (auto& [addr, name] : list)
+        req.out += fmt::format("{:04X} {}\n", addr, name);
+}
+
 void cmd_printregs(Request&)
 {
     Log(registers_string());
@@ -1575,6 +1748,14 @@ void cmd_coverage(Request& req)
     }
     else if (action == "get")
     {
+        // "get symbols" adds the label (or label+offset) in brackets after each address
+        bool names = req.args.size() > 1 && to_lower(req.args[1]) == "symbols";
+        if (req.args.size() > 1 && !names)
+        {
+            req.out += "Error. Use get or get symbols\n";
+            return;
+        }
+
         if (coverage.empty())
         {
             req.out += "\n";
@@ -1586,7 +1767,10 @@ void cmd_coverage(Request& req)
         {
             auto offset = AddrReadPtr(static_cast<uint16_t>(addr)) - pMemory;
             if (coverage[offset >> 3] & (1 << (offset & 7)))
-                s += fmt::format("{:04X} ", addr);
+            {
+                auto label = names ? sym_name(static_cast<uint16_t>(addr)) : "";
+                s += fmt::format("{:04X}{} ", addr, label.empty() ? "" : "(" + label + ")");
+            }
         }
         req.out += s + "\n";
     }
@@ -1726,8 +1910,10 @@ void cmd_io_log(Request& req)
         for (size_t i = first; i < io_log.size(); ++i)
         {
             auto& e = io_log[i];
-            req.out += fmt::format("frame={} cycle={} pc={:04X}H {} port={:04X}H value={:02X}H\n",
-                e.frame, e.cycle, e.pc, e.is_out ? "out" : "in", e.port, e.value);
+            auto label = sym_name(e.pc);
+            req.out += fmt::format("frame={} cycle={} pc={:04X}H {} port={:04X}H value={:02X}H{}\n",
+                e.frame, e.cycle, e.pc, e.is_out ? "out" : "in", e.port, e.value,
+                label.empty() ? "" : " sym=" + label);
         }
     }
     else if (action == "clear")
@@ -1802,7 +1988,11 @@ const std::vector<Command> commands
     { "putv", nullptr, "expression", "Adds the value of an expression to the log", cmd_putv },
     { "printregs", nullptr, "", "Adds the registers to the log", cmd_printregs },
 
-    { "cpu-code-coverage", nullptr, "enabled yes|no | clear | get | get-physical", "Records executed addresses; get lists them in the CPU's view, get-physical as page:offset", cmd_coverage },
+    { "load-symbols", nullptr, "file [append]", "Loads labels from a pyz80 .sym, an sjasmplus --sym= file or --lstlab listing, or a hexaddress=name file, replacing the current ones (or adding with append). A bad file is an error naming the line and loads nothing. Labels are 16-bit CPU-view addresses (no page); then accepted by name (name, name+N) in breakpoint conditions, printe/putv, set-register and wherever a command takes an address, and shown in disassemble, registers, stops, io-log and coverage get symbols", cmd_load_symbols },
+    { "clear-symbols", nullptr, "", "Removes all loaded labels", cmd_clear_symbols },
+    { "get-symbols", nullptr, "[prefix]", "Lists loaded labels (address name), sorted by address, optionally only those starting with prefix (not case sensitive)", cmd_get_symbols },
+
+    { "cpu-code-coverage", nullptr, "enabled yes|no | clear | get [symbols] | get-physical", "Records executed addresses; get lists them in the CPU's view (symbols adds the label of each, with loaded symbols), get-physical as page:offset", cmd_coverage },
 };
 
 void execute(const std::string& line, Request& req)
@@ -1816,7 +2006,8 @@ void execute(const std::string& line, Request& req)
 
     auto space = text.find_first_of(" \t");
     auto name = to_lower(text.substr(0, space));
-    req.raw_rest = (space == std::string::npos) ? "" : text.substr(text.find_first_not_of(" \t", space));
+    auto rest_start = (space == std::string::npos) ? space : text.find_first_not_of(" \t", space);
+    req.raw_rest = (rest_start == std::string::npos) ? "" : text.substr(rest_start);
     req.rest = trim(req.raw_rest);
     req.args = split(req.rest);
 
@@ -1880,9 +2071,9 @@ bool mem_breakpoint_hit(const uint8_t* phys, int type)
         if (mbp.page < 0 ? (addr < 0) : (page != mbp.page || offset < mbp.from || offset > mbp.to))
             continue;
 
-        stop_with(fmt::format("Memory breakpoint fired: {} {}:{:04X}H via {}, instruction at {:04X}H",
+        stop_with(fmt::format("Memory breakpoint fired: {} {}:{:04X}H via {}, instruction at {:04X}H{}",
             (type == MEMBP_READ) ? "read" : "write", Memory::PageDesc(page, true), offset,
-            (addr < 0) ? std::string("(unmapped)") : fmt::format("{:04X}H", addr), last_instr_pc));
+            (addr < 0) ? std::string("(unmapped)") : fmt::format("{:04X}H", addr), last_instr_pc, sym_suffix(last_instr_pc)));
         return true;
     }
 
@@ -1966,7 +2157,7 @@ void check_interrupt()
     if ((pending.type != Wait::Frames && pending.type != Wait::Break) || in_buf.size() <= pending.queued)
         return;
 
-    auto message = fmt::format("Interrupted by client input at PC={:04X}H", cpu.get_pc());
+    auto message = fmt::format("Interrupted by client input at PC={:04X}H{}", cpu.get_pc(), sym_suffix(cpu.get_pc()));
     if (pending.type == Wait::Frames)
         message += fmt::format(" after {} of {} frames", pending.total - pending.count, pending.total);
 
@@ -1983,7 +2174,7 @@ void check_window()
         return;
 
     auto by = Debug::IsActive() ? "debugger" : GUI::IsActive() ? "dialog" : "pause";
-    auto message = fmt::format("Interrupted by the emulator's {} at PC={:04X}H", by, cpu.get_pc());
+    auto message = fmt::format("Interrupted by the emulator's {} at PC={:04X}H{}", by, cpu.get_pc(), sym_suffix(cpu.get_pc()));
     if (pending.type == Wait::Frames)
         message += fmt::format(" after {} of {} frames", pending.total - pending.count, pending.total);
 
@@ -2162,7 +2353,7 @@ bool OnInstruction()
 
         if (fired && run_action(bp.action))
         {
-            stop_with(fmt::format("Breakpoint fired: {}", bp.condition));
+            stop_with(fmt::format("Breakpoint fired: {}{}", bp.condition, sym_suffix(cpu.get_pc())));
             stop = true;
         }
     }
@@ -2211,8 +2402,8 @@ void OnIO(uint16_t port, uint8_t value, bool is_out)
         {
             if ((pbp.type & (is_out ? PORTBP_OUT : PORTBP_IN)) && (port & pbp.mask) == pbp.port)
             {
-                stop_with(fmt::format("Port breakpoint fired: {} {:04X}H value {:02X}H, instruction at {:04X}H",
-                    is_out ? "OUT" : "IN", port, value, pc));
+                stop_with(fmt::format("Port breakpoint fired: {} {:04X}H value {:02X}H, instruction at {:04X}H{}",
+                    is_out ? "OUT" : "IN", port, value, pc, sym_suffix(pc)));
                 g_fBreak = true;
                 return;
             }

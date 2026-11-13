@@ -28,6 +28,17 @@ std::optional<int> LookupSymbol(const std::string& symbol);
 std::string LookupAddr(uint16_t addr, uint16_t lookup_context, int max_len = 0, bool allow_offset = false);
 std::string LookupPort(uint8_t port, bool input_port);
 
+// Symbols for the remote control (Remote.cpp). LoadFile reads a pyz80 .sym, an sjasmplus
+// --sym= file or --lstlab listing, or a hexaddress=name file; all or nothing, and the error
+// names the line. Labels are 16-bit CPU-view values, with no page.
+bool LoadFile(const std::string& path, bool append, std::string& error, size_t& loaded, size_t& skipped);
+void ClearRemote();
+bool HasRemote();
+size_t RemoteCount();
+std::vector<std::pair<uint16_t, std::string>> ListRemote(const std::string& prefix);
+std::optional<int> FindRemote(const std::string& name);
+std::string NameRemote(uint16_t addr, int max_offset);
+
 bool HasCometSymbols();
 bool SaveComet(const std::string& path);
 }
