@@ -83,6 +83,7 @@ constexpr auto MAX_PORT_BREAKPOINTS = 100;
 constexpr size_t MAX_IO_LOG = 100000;
 constexpr size_t MAX_IO_FILTERS = 64;
 constexpr int MS_PER_FRAME = 20;
+constexpr int DEFAULT_RUN_TO_FRAMES = 1500;
 
 namespace Remote
 {
@@ -101,13 +102,15 @@ bool close_after_flush;
 bool stopped;
 
 // A command waiting for emulated time to pass before it replies
-enum class Wait { None, Frames, Instructions, Break, Typing };
+enum class Wait { None, Frames, Instructions, Break, Typing, RunTo };
 struct Pending
 {
     Wait type = Wait::None;
     int count = 0;          // frames or instructions left (0 = no limit for Break)
     int total = 0;          // the count asked for
     int owner = 0;          // client connection that should get the reply
+    int target = 0;         // run-to: the address to stop at
+    uint64_t start_cycles = 0;  // run-to: the cycle total when it started
     size_t queued = 0;      // input already received when it started, which doesn't interrupt it
 };
 Pending pending;
@@ -168,6 +171,15 @@ bool io_filter_in = true, io_filter_out = true;
 std::deque<IoEntry> io_log;
 uint64_t io_dropped;
 uint64_t frame_count;                   // frames run since start-up
+uint64_t cycle_base;                    // absolute cycles when reset-tstates last ran
+
+// Cycles since start-up (or reset-tstates). The frame counter only advances once the frame's
+// cycles have been wrapped back into CPU::frame_cycles, so frames * cycles-per-frame + frame_cycles
+// is exact at any point an instruction can be observed, however far frame_cycles overshoots.
+uint64_t absolute_cycles()
+{
+    return frame_count * CPU_CYCLES_PER_FRAME + CPU::frame_cycles;
+}
 
 // Execution history: a ring of the state before each instruction, filled by OnInstruction while
 // enabled. A repeat of the same instruction (LDIR, HALT, JR $) replaces the entry and counts.
@@ -497,7 +509,8 @@ void update_trace()
 
     trace_instructions = coverage_enabled || history_enabled || any_breakpoints ||
         (breakpoints_enabled && !mem_breakpoints.empty()) ||
-        pending.type == Wait::Instructions || (pending.type == Wait::Break && pending.count);
+        pending.type == Wait::Instructions || (pending.type == Wait::Break && pending.count) ||
+        pending.type == Wait::RunTo;
 
     io_hooks = io_log_enabled || (breakpoints_enabled && !port_breakpoints.empty());
 }
@@ -1014,6 +1027,24 @@ void cmd_run_frames(Request& req)
     defer(req, Wait::Frames, frames);
 }
 
+// Runs until PC reaches the address (a one-shot breakpoint), then reports the cycles taken
+void cmd_run_to(Request& req)
+{
+    if (!can_defer(req) || !need_args(req, 1))
+        return;
+
+    int addr, frames = DEFAULT_RUN_TO_FRAMES;
+    if (!get_address_range(req, 0, addr, 0, 0xffff))
+        return;
+    if (req.args.size() > 1 && !get_number_range(req, 1, frames, 0, std::numeric_limits<int>::max()))
+        return;
+
+    stopped = false;
+    defer(req, Wait::RunTo, frames);
+    pending.target = addr;
+    pending.start_cycles = TotalCycles();
+}
+
 void cmd_reset(Request&)
 {
     CPU::Reset(true);
@@ -1235,9 +1266,15 @@ void cmd_get_screen_mode(Request& req)
         BORDER_COLOUR(io.border));
 }
 
+// The first line is the position in the frame, as before; the second the running total
 void cmd_get_tstates(Request& req)
 {
-    req.out += fmt::format("{}\n", CPU::frame_cycles);
+    req.out += fmt::format("{}\nTOTAL={}\n", CPU::frame_cycles, TotalCycles());
+}
+
+void cmd_reset_tstates(Request&)
+{
+    cycle_base = absolute_cycles();
 }
 
 // Disassembles one instruction. With symbols loaded, jump targets and operands are named (names
@@ -2106,12 +2143,14 @@ const std::vector<Command> commands
     { "exit-cpu-step", "resume", "", "Resumes the emulation", cmd_exit_step },
     { "cpu-step", "cs", "", "Runs one instruction, then shows the registers; an error while the window's debugger, a dialog or its pause holds the emulation", cmd_cpu_step },
     { "run", nullptr, "[instructions]", "Runs until a breakpoint fires, the client sends anything (or a new client does), or after the given number of instructions (0 = no limit); then stops. An error while the window's debugger, a dialog or its pause holds the emulation, and one opening ends it", cmd_run },
+    { "run-to", nullptr, "addr [max-frames]", "Runs until PC reaches the address (a label is fine) and reports the T-states taken; the instruction at PC now runs first. Gives up after max-frames frames (default 1500, 0 = no limit). A breakpoint, any client input, or the window's debugger, a dialog or its pause stops it early, as for run", cmd_run_to },
     { "run-frames", "rf", "[frames]", "Runs the given number of frames (default 1), then stops; a breakpoint, any input from a client, or the window's debugger, a dialog or its pause stops it early (an error if one is already open)", cmd_run_frames },
     { "reset-cpu", nullptr, "", "Resets the SAM", cmd_reset },
     { "hard-reset-cpu", nullptr, "", "Clears RAM and resets the SAM", cmd_hard_reset },
     { "generate-nmi", nullptr, "", "Generates an NMI", cmd_nmi },
     { "set-speed", nullptr, "[normal|turbo|percent]", "Sets or shows the emulation speed (turbo = unthrottled)", cmd_set_speed },
-    { "get-tstates", nullptr, "", "Shows the T-state count within the current frame", cmd_get_tstates },
+    { "get-tstates", nullptr, "", "Shows the T-state count within the current frame, then TOTAL=: T-states since start-up or reset-tstates (a reset doesn't clear it); expressions can use it as cycles (low 32 bits)", cmd_get_tstates },
+    { "reset-tstates", nullptr, "", "Zeroes the TOTAL of get-tstates (not the position in the frame)", cmd_reset_tstates },
     { "disassemble", "d", "[address] [lines]", "Disassembles from the CPU's view of memory (default PC); address 0-FFFFH, up to 65536 lines", cmd_disassemble },
 
     { "read-memory", nullptr, "address [length]", "Reads memory as hex, from the current memory zone (the block must lie inside the zone; at most 16M)", cmd_read_memory },
@@ -2321,7 +2360,7 @@ void read_client()
 // send the run).
 void check_interrupt()
 {
-    if ((pending.type != Wait::Frames && pending.type != Wait::Break) || in_buf.size() <= pending.queued)
+    if ((pending.type != Wait::Frames && pending.type != Wait::Break && pending.type != Wait::RunTo) || in_buf.size() <= pending.queued)
         return;
 
     auto message = fmt::format("Interrupted by client input at PC={:04X}H{}", cpu.get_pc(), sym_suffix(cpu.get_pc()));
@@ -2437,6 +2476,11 @@ void Exit()
     }
 }
 
+uint64_t TotalCycles()
+{
+    return absolute_cycles() - cycle_base;
+}
+
 bool IsActive()
 {
     return listen_socket != INVALID_SOCKET;
@@ -2504,6 +2548,16 @@ bool OnInstruction()
             complete((pending.type == Wait::Instructions) ? registers_string() + "\n" : "Stopped after the instruction limit\n");
             return true;
         }
+    }
+
+    if (pending.type == Wait::RunTo && cpu.get_pc() == pending.target)
+    {
+        auto cycles = TotalCycles() - pending.start_cycles;
+        stopped = true;
+        auto message = fmt::format("Reached {:04X}H{} after {} T-states", pending.target, sym_suffix(pending.target), cycles);
+        Log(message);
+        complete(message + "\n");
+        return true;
     }
 
     if (!breakpoints_enabled)
@@ -2583,8 +2637,8 @@ void OnIO(uint16_t port, uint8_t value, bool is_out)
 
 void OnFrameEnd()
 {
-    frame_count++;
-
+    // frame_count is advanced at the end: CPU::frame_cycles is only wrapped after this returns
+    // (so the total, frames x cycles + frame_cycles, is right for the whole of it)
     if (pending.type == Wait::Typing && --type_frames_left <= 0)
     {
         if (type_key_down)
@@ -2610,6 +2664,16 @@ void OnFrameEnd()
         stopped = true;
         complete("");
     }
+    else if (pending.type == Wait::RunTo && pending.total && --pending.count <= 0)
+    {
+        auto message = fmt::format("Gave up after {} frames without reaching {:04X}H, PC={:04X}H{}, {} T-states",
+            pending.total, pending.target, cpu.get_pc(), sym_suffix(cpu.get_pc()), TotalCycles() - pending.start_cycles);
+        Log(message);
+        stopped = true;
+        complete(message + "\n");
+    }
+
+    frame_count++;
 }
 
 void ApplyKeys(std::array<uint8_t, 9>& key_matrix)

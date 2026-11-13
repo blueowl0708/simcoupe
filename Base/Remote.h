@@ -27,6 +27,11 @@ void Exit();
 void Poll();
 
 bool IsActive();
+
+// T-states since start-up or the last reset-tstates (frames run x cycles per frame + the
+// position in the frame, so it costs nothing per instruction)
+uint64_t TotalCycles();
+
 bool IsStopped();
 
 // Say on the status line that remote control has stopped the emulation, and redraw the

@@ -885,8 +885,8 @@ continue.
 | Group | Commands |
 |---|---|
 | Session | `help`, `get-version`, `noop`, `quit`, `exit-emulator` |
-| CPU | `get-registers` (ZRCP format plus LMPR/HMPR/VMPR), `set-register reg=value ...` (also LMPR, HMPR, VMPR, BORDER), `enter-cpu-step`/`pause`, `exit-cpu-step`/`resume`, `cpu-step`, `run [instructions]`, `reset-cpu`, `hard-reset-cpu` (also clears RAM), `generate-nmi`, `get-tstates`, `disassemble [addr] [lines]` |
-| Speed | `run-frames [N]` (run N frames, then stop; interruptible), `set-speed normal\|turbo\|percent` |
+| CPU | `get-registers` (ZRCP format plus LMPR/HMPR/VMPR), `set-register reg=value ...` (also LMPR, HMPR, VMPR, BORDER), `enter-cpu-step`/`pause`, `exit-cpu-step`/`resume`, `cpu-step`, `run [instructions]`, `reset-cpu`, `hard-reset-cpu` (also clears RAM), `generate-nmi`, `get-tstates`, `reset-tstates`, `disassemble [addr] [lines]` |
+| Speed | `run-frames [N]` (run N frames, then stop; interruptible), `run-to addr [max-frames]` (run until PC reaches an address, reporting the T-states taken), `set-speed normal\|turbo\|percent` |
 | Memory | `read-memory addr [len]`, `write-memory addr byte ...`, `write-memory-raw addr hex`, `load-binary file addr [len]`, `save-binary file addr len`, `get-memory-zones`, `set-memory-zone n` |
 | Paging | `get-paging-state` (ports, mode, ROM/write-protect state and the page in each section) |
 | Keys | `send-keys-event key 1\|0`, `send-keys-string ms text`, `send-keys-ascii ms code ...`, `release-keys` |
@@ -1009,6 +1009,36 @@ by the remote itself (`set-register lmpr=...`) or by the debugger is not
 logged. With the log off and no port breakpoints set, I/O costs nothing extra.
 Unlike ZEsarUX, which has no port breakpoint command, the names and the mask
 are SAM-specific.
+
+Cycle counter. `get-tstates` replies with the position in the current frame
+on its first line (as before), and `TOTAL=n` on a second: the T-states the CPU
+has run since start-up, as frames run times 119808 plus the position in the
+frame, so keeping it costs nothing per instruction. It stops and starts with
+the emulation, and a CPU reset does not clear it. `reset-tstates` zeroes the
+total (the position in the frame is a property of the emulation and stays).
+Contention is included: the figures are the SAM's real timing, with the waits
+for internal RAM and the ASIC ports, so they depend on the screen mode and
+where in the frame the code runs. The total is also an expression variable,
+`cycles`, for conditions, `printe` and `putv` while remote control is on (as
+for any expression, a number without an `H` suffix or trailing dot is hex).
+Expressions are 32-bit, so `cycles` is the low 32 bits of the total as a signed
+number (it wraps after about six minutes of emulated time without
+`reset-tstates`). Two logging breakpoints (`sb 1 PC=8007H`, `sba 1 putv
+cycles`, and the same at the other address) therefore give the cycles between
+two PCs by subtraction. `run-to addr [max-frames]` is the one-shot form: it
+runs until PC reaches the address (a number or a label), stops, and replies
+`Reached 800AH after 304 T-states` (counted from when the command was sent, up
+to the point just before the instruction at the address runs). The instruction
+at the current PC always runs first, so with PC already at the address it stops
+the next time it arrives. After `max-frames` frames (default 1500; 0 for no
+limit) it gives up with `Gave up after N frames without reaching 8000H,
+PC=xxxxH, n T-states`, and the emulation is stopped. Like `run` it is ended
+early by a breakpoint, by any input from a client, or by the window's debugger,
+a dialog or its pause (and refused if one is open already), and can't be used
+in a breakpoint action. Unlike ZEsarUX, whose `get-tstates` is only the
+position in the frame and whose only reset command is `reset-tstates-partial`
+for a separate partial counter, this is one running total with a plain
+`reset-tstates`; ZEsarUX has no `run-to` command.
 
 Symbols. `load-symbols file [append]` loads labels from an assembler's symbol
 file: a pyz80 `--exportfile` (a Python pickle, as the Rebelstar II SAM build

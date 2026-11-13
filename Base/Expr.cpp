@@ -24,6 +24,7 @@
 #include "Expr.h"
 #include "Frame.h"
 #include "Options.h"
+#include "Remote.h"
 #include "Symbol.h"
 
 const Expr Expr::Counter{ "(counter)", { { TokenType::Variable, Token::Count} } };
@@ -242,6 +243,10 @@ int Expr::Eval(const std::vector<Node>& nodes)
                 r = cpu.is_halted() ? 1 : 0;
                 break;
 
+            case Token::Cycles:
+                r = static_cast<int>(Remote::TotalCycles());    // the low 32 bits
+                break;
+
             case Token::DLine:
             {
                 auto [line, line_cycle] = Frame::GetRasterPos(CPU::frame_cycles);
@@ -415,6 +420,11 @@ bool Expr::Factor(const char*& p, int flags)
         else if (!(flags & noVars) && FindToken(str_token, var_tokens, token))
         {
             nodes.push_back({ TokenType::Variable, token.token });
+        }
+        else if (!(flags & noVars) && Remote::IsActive() && tolower(str_token) == "cycles")
+        {
+            // Only while remote control is on, so it never changes the debugger for anyone else
+            nodes.push_back({ TokenType::Variable, Token::Cycles });
         }
         else if (!(flags & noSyms) && (sym_value = Symbol::LookupSymbol(str_token)))
         {
